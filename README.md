@@ -2,7 +2,7 @@
 
 A single-file, read-only Python script that performs a **server-level root cause analysis** on a Cloudways server.
 
-Run it, answer two questions (**From** and **To**), and it investigates the window the way an engineer would: OOM kills, reboots, service crashes, CPU/memory history, configuration red flags, PHP-FPM, MySQL/MariaDB and traffic. It ends with the top culprits, optimizations, an upscale decision, a one-line verdict and a customer-shareable paragraph.
+Run it, answer two questions (**From** and **To**), and it investigates the window the way an engineer would: OOM kills, reboots, service crashes, CPU/memory history, configuration red flags, PHP-FPM, MySQL/MariaDB and traffic. The report comes in two phases: **Phase 1** gives you the full internal insights, starting with an executive summary and the top 3 applications by CPU and memory with their traffic status; **Phase 2** is a customer-shareable report you can send as-is.
 
 It complements [cloudways-app-investigator](https://github.com/jahanzaibakhan/cloudways-app-investigator): that tool answers *"which application is heavy right now?"*, this one answers *"why did the server go down / slow down between these dates?"*.
 
