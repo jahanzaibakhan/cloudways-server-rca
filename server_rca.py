@@ -39,7 +39,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 WIDTH = 100
 
 # ----------------------------------------------------------------------------
@@ -168,6 +168,32 @@ HL_RE = re.compile(r"\[(?:Confirmed|Likely|Suspected|Unknown)\]|CRITICAL|RESTART
 HL_COLORS = {"[Confirmed]": "green", "CRITICAL": "red", "RESTARTED INSIDE THE WINDOW": "red"}
 CELL_COLORS = {"Normal": "green", "Needs review": "yellow", "Elevated errors": "yellow", "No data": "dim", "YES": "red"}
 HOUR_KEY = "%Y-%m-%d %H"
+MINUTE_KEY = "%Y-%m-%d %H:%M"
+APACHE_ERR_GLOB = "/var/log/apache2/error.log*"
+INCIDENT_GAP_S = 600        # events closer than this belong to the same incident
+LEAD_MIN = 10               # minutes before an incident that are analysed as "what led to it"
+NGX_ERR_TS_RE = re.compile(r"^(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+APA_ERR_TS_RE = re.compile(r"^\[[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? (\d{4})\]")
+PHP_ERR_TS_RE = re.compile(r"^\[(\d{1,2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2})(?: ([A-Za-z/_+\-0-9:]+))?\]")
+ERR_PATH_RE = re.compile(r" in (/\S+?\.php)(?:[: (]|$)")
+ERR_MSG_RE = re.compile(r"PHP (?:Fatal|Parse) error:\s+(.*)")
+# (key, internal label, customer wording, substrings). Order matters: the first match wins.
+ERR_CATS = [
+    ("php-memory", "PHP memory limit exhausted", "PHP ran out of its memory limit", ("Allowed memory size of",)),
+    ("php-timeout", "PHP max execution time exceeded", "PHP scripts exceeded the maximum execution time",
+     ("Maximum execution time of",)),
+    ("db", "Database connection errors", "the website could not connect to the database",
+     ("Error establishing a database connection", "MySQL server has gone away", "HY000/2002", "HY000/1040",
+      "Too many connections")),
+    ("php-fatal", "PHP fatal errors", "PHP fatal errors in the application code", ("PHP Fatal error", "PHP Parse error")),
+    ("upstream-timeout", "Backend timeouts (504)", "requests timed out waiting for the application",
+     ("upstream timed out", "AH01075", "The timeout specified has expired")),
+    ("upstream-down", "Backend unavailable (502/503)", "the application backend was unavailable",
+     ("connect() failed", "no live upstreams", "upstream prematurely closed", "AH01079", "AH00957", "AH02454")),
+    ("rate-limit", "Requests rejected by rate limiting", "requests were rejected by rate limiting",
+     ("limiting requests", "limiting connections")),
+]
+ERR_LABEL = {c[0]: (c[1], c[2]) for c in ERR_CATS}
 
 
 # ----------------------------------------------------------------------------
@@ -185,6 +211,8 @@ class Ctx:
         self.pools = {}
         self.user_to_app = {}
         self._class_cache = {}
+        self.watch = {}                                  # minute key -> incident index (set before the log scans)
+        self.inc_detail = defaultdict(new_incident_detail)
 
     def progress(self, msg):
         if self.args is None or not getattr(self.args, "quiet", False):
@@ -340,6 +368,44 @@ def fmt_kb(kb):
     if mb >= 1024:
         return "%.2f GB" % (mb / 1024)
     return "%.1f MB" % mb if mb < 10 else "%.0f MB" % mb
+
+
+def fmt_dur(seconds):
+    m = int(round(seconds / 60.0))
+    if m < 1:
+        return "< 1 min"
+    if m < 60:
+        return "%d min" % m
+    return "%d h %02d min" % (m // 60, m % 60)
+
+
+def minute_range(a, b):
+    """Minute keys from a to b inclusive (capped at 12 hours)."""
+    t, out = a.replace(second=0, microsecond=0), []
+    while t <= b and len(out) < 720:
+        out.append(t.strftime(MINUTE_KEY))
+        t += timedelta(minutes=1)
+    return out
+
+
+def new_incident_detail():
+    return {"req": Counter(), "s5": Counter(), "ips": Counter(), "php": defaultdict(lambda: [0, 0.0, 0]),
+            "uri": defaultdict(lambda: [0, 0.0, 0.0]), "sql_n": 0, "sql": defaultdict(lambda: [0, 0.0])}
+
+
+def error_line_ts(line):
+    """Timestamp of an nginx, Apache or PHP error-log line (server-local), or None."""
+    m = NGX_ERR_TS_RE.match(line)
+    if m:
+        return make_ts(*m.groups())
+    m = APA_ERR_TS_RE.match(line)
+    if m:
+        return make_ts(m.group(6), m.group(1), m.group(2), m.group(3), m.group(4), m.group(5))
+    m = PHP_ERR_TS_RE.match(line)
+    if m:
+        return make_ts(m.group(3), m.group(2), m.group(1), m.group(4), m.group(5), m.group(6),
+                       "+0000" if m.group(7) == "UTC" else None)
+    return None
 
 
 def fmt_num(n):
@@ -572,6 +638,7 @@ def collect_apps(ctx):
                 "web_log_kind": "nginx" if nginx else ("backend" if backend else ""),
                 "fpm_access_logs": [os.path.join(logs, n) for n in names if n.startswith("php-app.access.log")],
                 "fpm_slow_logs": [os.path.join(logs, n) for n in names if n.startswith("php-app.slow.log")],
+                "error_logs": [os.path.join(logs, n) for n in names if "error.log" in n],
             }
     return apps
 
@@ -1031,7 +1098,7 @@ def atop_history(ctx, start, end):
     owners = defaultdict(lambda: {"cpu_sum": 0.0, "cpu_peak": 0.0, "cpu_peak_at": "", "rss_sum": 0.0,
                                   "rss_peak": 0.0, "rss_peak_at": "", "n": 0})
     days = {}
-    worst_cpu, worst_mem = [], []
+    worst_cpu, worst_mem, samples = [], [], []
     tot = {"n": 0, "files": 0, "interval": 0, "mem_total_kb": 0}
 
     def flush(s):
@@ -1079,6 +1146,8 @@ def atop_history(ctx, start, end):
         tot["mem_total_kb"] = s.get("mem_total_kb", tot["mem_total_kb"])
         top_c = sorted(oc.items(), key=lambda kv: -kv[1])[:3]
         top_m = sorted(orss.items(), key=lambda kv: -kv[1])[:3]
+        if len(samples) < 9000:
+            samples.append((ts, cpu, mem, s.get("swap_used_kb", 0.0), top_c, top_m))
         worst_cpu.append((cpu, stamp, [(k, v) for k, v in top_c]))
         worst_mem.append((mem, stamp, [(k, v) for k, v in top_m], s.get("swap_used_kb", 0.0)))
         if len(worst_cpu) > 400:
@@ -1181,7 +1250,7 @@ def atop_history(ctx, start, end):
             "swap_peak_kb": max(d["swap_peak_kb"] for d in days.values()),
             "iowait": sum(d["iowait_sum"] for d in days.values()) / n,
             "steal": sum(d["steal_sum"] for d in days.values()) / n,
-            "worst_cpu": worst_cpu[:6], "worst_mem": worst_mem[:6]}
+            "worst_cpu": worst_cpu[:6], "worst_mem": worst_mem[:6], "samples": samples}
 
 
 # ----------------------------------------------------------------------------
@@ -1194,7 +1263,7 @@ def pool_app(ctx, pool):
 def scan_fpm_master_logs(ctx, start, end):
     per = defaultdict(lambda: {"max_children": 0, "limit": None, "sigkill": 0, "sigsegv": 0, "timeouts": 0,
                                "by_day": Counter()})
-    by_hour, restarts = Counter(), Counter()
+    by_hour, restarts, mc_min = Counter(), Counter(), Counter()
     every = glob.glob(FPM_LOG_GLOB)
     files = [f for f in files_for_window(FPM_LOG_GLOB, start) if os.access(f, os.R_OK)]
     if every and not any(os.access(f, os.R_OK) for f in every):
@@ -1206,9 +1275,11 @@ def scan_fpm_master_logs(ctx, start, end):
                 pm = FPM_POOL_RE.search(line)
                 if not pm or not in_window(ts, start, end):
                     continue
-                o = per[pool_app(ctx, pm.group(1))]
+                app = pool_app(ctx, pm.group(1))
+                o = per[app]
                 mc = FPM_MAXCHILD_RE.search(line)
                 if mc:
+                    mc_min[(ts.strftime(MINUTE_KEY), app)] += 1
                     o["max_children"] += 1
                     o["limit"] = int(mc.group(1))
                     o["by_day"][ts.strftime("%Y-%m-%d")] += 1
@@ -1225,7 +1296,7 @@ def scan_fpm_master_logs(ctx, start, end):
                 ts = fpm_line_ts(line)
                 if in_window(ts, start, end):
                     restarts[ts.strftime("%Y-%m-%d")] += 1
-    return {"per_app": dict(per), "by_hour": by_hour, "restarts": restarts, "files": len(files)}
+    return {"per_app": dict(per), "by_hour": by_hour, "restarts": restarts, "files": len(files), "mc_min": mc_min}
 
 
 class HourCache:
@@ -1268,7 +1339,8 @@ def is_bot_ua(ua, cache={}):  # noqa: B006 - intentional cache
 def scan_traffic(ctx, start, end, deadline):
     """Per-application web access logs: requests, 5xx, top IPs, bots, login/xmlrpc abuse, per-hour totals."""
     hc = HourCache(start, end)
-    per, hour_req, hour_5xx = {}, Counter(), Counter()
+    per, hour_req, hour_5xx, min_req, min_5xx = {}, Counter(), Counter(), Counter(), Counter()
+    watch, det = ctx.watch, ctx.inc_detail
     skipped, unreadable = [], 0
     sized = []
     for name, app in ctx.apps.items():
@@ -1283,7 +1355,7 @@ def scan_traffic(ctx, start, end, deadline):
             skipped.append(name)
             continue
         a = {"req": 0, "s5": 0, "s4": 0, "bots": 0, "login": 0, "xmlrpc": 0, "ips": Counter(), "hours": Counter(),
-             "status": Counter(), "partial": False}
+             "status": Counter(), "partial": False, "min5": Counter()}
         n = 0
         for f in files:
             if not os.access(f, os.R_OK):
@@ -1305,9 +1377,21 @@ def scan_traffic(ctx, start, end, deadline):
                 a["status"][status] += 1
                 a["ips"][m.group(1)] += 1
                 hour_req[hk] += 1
+                mk = hk + ":" + m.group(3)
+                min_req[mk] += 1
+                wi = watch.get(mk)
+                if wi is not None:
+                    dd = det[wi]
+                    dd["req"][name] += 1
+                    if len(dd["ips"]) < 5000 or m.group(1) in dd["ips"]:
+                        dd["ips"][m.group(1)] += 1
                 if status[0] == "5":
                     a["s5"] += 1
                     hour_5xx[hk] += 1
+                    min_5xx[mk] += 1
+                    a["min5"][mk] += 1
+                    if wi is not None:
+                        dd["s5"][name] += 1
                 elif status[0] == "4":
                     a["s4"] += 1
                 uri = m.group(6)
@@ -1335,7 +1419,8 @@ def scan_traffic(ctx, start, end, deadline):
                  "(raise --log-budget). Skipped: %s" % (len(skipped), ", ".join(skipped[:8]) + ("…" if len(skipped) > 8 else "")))
     if unreadable:
         ctx.note("%d web access log file(s) were not readable (run as root)." % unreadable)
-    return {"per_app": per, "hour_req": hour_req, "hour_5xx": hour_5xx, "skipped": skipped}
+    return {"per_app": per, "hour_req": hour_req, "hour_5xx": hour_5xx, "skipped": skipped,
+            "min_req": min_req, "min_5xx": min_5xx}
 
 
 def scan_fpm_access(ctx, start, end, deadline):
@@ -1396,6 +1481,18 @@ def scan_fpm_access(ctx, start, end, deadline):
                     u[0] += 1
                     u[1] += cpu
                     u[2] += dur
+                wi = ctx.watch.get(hk + ":" + m.group(3))
+                if wi is not None:
+                    dd = ctx.inc_detail[wi]
+                    pp = dd["php"][name]
+                    pp[0] += 1
+                    pp[1] += cpu
+                    pp[2] += 1 if dur >= 5 else 0
+                    if (name, uri) in dd["uri"] or len(dd["uri"]) < 3000:
+                        uu = dd["uri"][(name, uri)]
+                        uu[0] += 1
+                        uu[1] += cpu
+                        uu[2] += dur
                 if n % 50000 == 0 and time.time() > deadline:
                     stop = True
                     break
@@ -1443,6 +1540,268 @@ def scan_slow_logs(ctx, start, end):
             per[name] = {"traces": traces, "components": comps.most_common(4), "functions": funcs.most_common(3),
                          "hours": hours}
     return per
+
+
+# ----------------------------------------------------------------------------
+# Error logs (per application) and incident reconstruction
+# ----------------------------------------------------------------------------
+def scan_error_logs(ctx, start, end, deadline):
+    """Per-application nginx/Apache/PHP error logs: why requests failed (memory limit, fatals, timeouts, DB)."""
+    per, totals, skipped = {}, Counter(), 0
+    for name, app in ctx.apps.items():
+        files = [f for f in files_for_window(app.get("error_logs", []), start) if os.access(f, os.R_OK)]
+        if not files:
+            continue
+        if time.time() > deadline:
+            skipped += 1
+            continue
+        a = {"counts": Counter(), "min": Counter(), "components": Counter(), "messages": Counter()}
+        n, stop = 0, False
+        for f in files:
+            for line in iter_lines(f):
+                n += 1
+                if n % 50000 == 0 and time.time() > deadline:
+                    stop = True
+                    break
+                cat = None
+                for key, _, _, needles in ERR_CATS:
+                    for nd in needles:
+                        if nd in line:
+                            cat = key
+                            break
+                    if cat:
+                        break
+                if not cat:
+                    continue
+                ts = error_line_ts(line)
+                if not in_window(ts, start, end):
+                    continue
+                a["counts"][cat] += 1
+                if len(a["min"]) < 50000:
+                    a["min"][(ts.strftime(MINUTE_KEY), cat)] += 1
+                if cat.startswith("php"):
+                    pm = ERR_PATH_RE.search(line)
+                    if pm:
+                        a["components"][component_of(pm.group(1))] += 1
+                    mm = ERR_MSG_RE.search(line)
+                    if mm:
+                        msg = mm.group(1).split("Stack trace")[0].split("\\n")[0].split("', referer")[0].split('" while ')[0]
+                        msg = re.sub(r"/home/\S+?/public_html/", "", msg)
+                        msg = trunc(re.sub(r"\b\d{5,}\b", "N", msg).strip(" '\""), 170)
+                        if msg in a["messages"] or len(a["messages"]) < 2000:
+                            a["messages"][msg] += 1
+            if stop:
+                break
+        if a["counts"]:
+            a["messages"] = a["messages"].most_common(4)
+            a["components"] = a["components"].most_common(4)
+            per[name] = a
+            totals.update(a["counts"])
+    workers = 0
+    for f in files_for_window(APACHE_ERR_GLOB, start):
+        if os.access(f, os.R_OK):
+            for line in iter_lines(f):
+                if "MaxRequestWorkers" in line and in_window(error_line_ts(line), start, end):
+                    workers += 1
+    if skipped:
+        ctx.note("Error-log time budget reached - %d application(s) not parsed (raise --log-budget)." % skipped)
+    return {"per_app": per, "totals": totals, "apache_workers": workers}
+
+
+def customer_unit(unit):
+    u = unit.lower()
+    if u.startswith(("mariadb", "mysql")):
+        return "the database service"
+    if "fpm" in u or u.startswith("php"):
+        return "the PHP service"
+    if u.startswith(("redis", "memcached")):
+        return "the cache service"
+    if u.startswith(("nginx", "apache", "httpd", "varnish")):
+        return "the web server"
+    return "a system service"
+
+
+def prepare_incidents(ctx, R):
+    """Cluster outage events (OOM kills, reboots, service failures, DB restarts) into incidents.
+
+    Runs before the access-log scans so they can record what happened in the minutes leading up to each one.
+    """
+    ev = []
+    for e in R["sys"]["oom"]:
+        ev.append({"ts": e["ts"], "kind": "oom", "cust": "Server ran out of memory",
+                   "label": "OOM kill: %s (%s)" % (e["name"], "cgroup limit" if e["cgroup"] else "server-wide"),
+                   "holders": e["holders"][:4], "snap_total_kb": e["snap_total_kb"]})
+    for r in R["reboots"]:
+        ev.append({"ts": r["ts"], "kind": "reboot", "cust": "Server restarted",
+                   "label": "Server booted (%s)" % {True: "clean shutdown recorded", False: "no shutdown record",
+                                                    None: "shutdown record unknown"}[r["clean"]]})
+    for e in R["sys"]["svc_events"]:
+        cu = customer_unit(e["unit"])
+        ev.append({"ts": e["ts"], "kind": "service", "label": "%s: %s" % (e["unit"], e["what"]),
+                   "cust": cu[4].upper() + cu[5:] + " restarted"})
+    for t in R["mysql_err"]["startups"]:
+        ev.append({"ts": t, "kind": "db-restart", "label": "MariaDB/MySQL started", "cust": "Database service restarted"})
+    ev.sort(key=lambda e: e["ts"])
+    incs = []
+    for e in ev:
+        if incs and (e["ts"] - incs[-1]["end"]).total_seconds() <= INCIDENT_GAP_S:
+            incs[-1]["end"] = e["ts"]
+            incs[-1]["events"].append(e)
+        else:
+            incs.append({"start": e["ts"], "end": e["ts"], "events": [e], "idx": len(incs)})
+    ctx.watch = {}
+    for inc in incs[:300]:
+        for mk in minute_range(inc["start"] - timedelta(minutes=LEAD_MIN), inc["end"] + timedelta(minutes=5)):
+            ctx.watch.setdefault(mk, inc["idx"])
+    return incs
+
+
+def finalize_incidents(ctx, R):
+    """Add 5xx bursts, measure the impact of every incident and describe what led to it."""
+    meta, tr, at = R["meta"], R["traffic"], R.get("atop")
+    min_req, min_5xx = tr.get("min_req", Counter()), tr.get("min_5xx", Counter())
+    app5 = {n: a.get("min5", {}) for n, a in tr["per_app"].items()}
+    hot = set()
+    for n, m5 in app5.items():
+        hot.update(mk for mk, c in m5.items() if c >= 20)
+
+    def impacted(mk):
+        c = min_5xx.get(mk, 0)
+        share = pct(c, min_req.get(mk, 0))
+        return mk in hot or (c >= 5 and share >= 10) or (c >= 3 and share >= 30)
+    incs = list(R.get("incidents_base") or [])
+    # --- bursts of 5xx with no system event nearby become incidents of their own
+    bad = sorted(mk for mk, c in min_5xx.items() if mk in hot or (c >= 10 and pct(c, min_req.get(mk, 0)) >= 20))
+    bursts = []
+    for mk in bad:
+        t = datetime.strptime(mk, MINUTE_KEY)
+        if bursts and (t - bursts[-1][1]).total_seconds() <= 300:
+            bursts[-1][1] = t
+            bursts[-1][2] += 1
+            bursts[-1][3] += min_5xx[mk]
+        else:
+            bursts.append([t, t, 1, min_5xx[mk]])
+    for b0, b1, mins, errs in bursts:
+        if mins < 2 and errs < 50:
+            continue
+        if any(b0 <= i["end"] + timedelta(minutes=15) and b1 >= i["start"] - timedelta(minutes=LEAD_MIN) for i in incs):
+            continue
+        incs.append({"start": b0, "end": b1 + timedelta(seconds=59), "idx": None, "burst": True,
+                     "events": [{"ts": b0, "kind": "errors", "cust": "Burst of server errors",
+                                 "label": "Burst of 5xx errors (%s in %d min)" % (fmt_num(errs), mins)}]})
+    incs.sort(key=lambda i: i["start"])
+    window_min = max((meta["end"] - meta["start"]).total_seconds() / 60.0, 1.0)
+    normal = sum(a["req"] for a in tr["per_app"].values()) / window_min
+    samples = at["samples"] if at else []
+    site = defaultdict(lambda: {"incidents": 0, "errors": 0})
+    for k, inc in enumerate(incs):
+        inc["id"] = k + 1
+        inc["kinds"] = sorted({e["kind"] for e in inc["events"]})
+        lo = inc["start"] if inc.get("burst") else inc["start"] - timedelta(minutes=LEAD_MIN)
+        hi = inc["end"] if inc.get("burst") else inc["end"] + timedelta(minutes=30)
+        if k + 1 < len(incs):
+            hi = min(hi, incs[k + 1]["start"] - timedelta(minutes=1))
+        hi = min(max(hi, inc["end"]), meta["end"])
+        imp = [mk for mk in minute_range(lo, hi) if impacted(mk)]
+        inc["measured"] = bool(imp)
+        inc["impact_s"] = len(imp) * 60 if imp else max((inc["end"] - inc["start"]).total_seconds(), 0)
+        inc["impact_from"], inc["impact_to"] = (imp[0], imp[-1]) if imp else (None, None)
+        inc["errors"] = sum(min_5xx.get(mk, 0) for mk in imp)
+        apps = Counter()
+        for n, m5 in app5.items():
+            c = sum(m5.get(mk, 0) for mk in imp)
+            if c:
+                apps[n] = c
+        inc["apps"] = apps.most_common()
+        for n, c in inc["apps"]:
+            site[n]["incidents"] += 1
+            site[n]["errors"] += c
+        # state just before (atop)
+        before = [x for x in samples if inc["start"] - timedelta(minutes=20) <= x[0] <= inc["start"] + timedelta(minutes=1)]
+        inc["before"] = before[-1] if before else None
+        around = [x for x in samples if inc["start"] - timedelta(minutes=LEAD_MIN) <= x[0] <= inc["end"] + timedelta(minutes=10)]
+        inc["peak_cpu"] = max(x[1] for x in around) if around else None
+        inc["peak_mem"] = max(x[2] for x in around) if around else None
+        # what was running in the lead-up (collected during the log scans)
+        d = ctx.inc_detail.get(inc["idx"]) if inc["idx"] is not None else None
+        lead = {}
+        if d:
+            mins = len(minute_range(inc["start"] - timedelta(minutes=LEAD_MIN), inc["end"] + timedelta(minutes=5)))
+            req = sum(d["req"].values())
+            php_cpu = sum(v[1] for v in d["php"].values())
+            lead = {"minutes": mins, "req": req, "s5": sum(d["s5"].values()),
+                    "ratio": (req / float(mins)) / normal if normal else 0.0,
+                    "apps": d["req"].most_common(3), "top_ip": d["ips"].most_common(1),
+                    "php_cpu": php_cpu,
+                    "php": sorted(((n, v[0], v[1], v[2]) for n, v in d["php"].items()), key=lambda x: -x[2])[:3],
+                    "uris": sorted(((n, u, v[0], v[1], v[2] / v[0]) for (n, u), v in d["uri"].items()), key=lambda x: -x[3])[:3],
+                    "sql_n": d["sql_n"],
+                    "sql": sorted(((db, fp, v[0], v[1]) for (db, fp), v in d["sql"].items()), key=lambda x: -x[3])[:2]}
+        inc["lead"] = lead
+        mkset = set(minute_range(inc["start"] - timedelta(minutes=LEAD_MIN), inc["end"] + timedelta(minutes=10)))
+        errs = defaultdict(Counter)
+        for n, e in R["errors"]["per_app"].items():
+            for (mk, cat), c in e["min"].items():
+                if mk in mkset:
+                    errs[cat][n] += c
+        inc["errlog"] = {cat: v.most_common(3) for cat, v in errs.items()}
+        mc = Counter()
+        for (mk, app), c in R["fpm"].get("mc_min", {}).items():
+            if mk in mkset:
+                mc[app] += c
+        inc["max_children"] = mc.most_common(3)
+        inc["trigger"] = incident_trigger(ctx, R, inc)
+    # --- recurrence: same hour of day on several days points to a scheduled job
+    by_hod = defaultdict(set)
+    for inc in incs:
+        by_hod[inc["start"].hour].add(inc["start"].date())
+    recurring = ""
+    if by_hod:
+        hod, dayset = max(by_hod.items(), key=lambda kv: len(kv[1]))
+        if len(dayset) >= 3:
+            recurring = ("Incidents started between %02d:00 and %02d:59 on %d different days - a scheduled job "
+                         "(cron, backup, scan, import) at that time is the likely trigger." % (hod, hod, len(dayset)))
+    return {"list": incs, "count": len(incs), "impact_s": sum(i["impact_s"] for i in incs),
+            "errors": sum(i["errors"] for i in incs), "measured": sum(1 for i in incs if i["measured"]),
+            "recurring": recurring, "sites": {n: dict(v) for n, v in site.items()}}
+
+
+def incident_trigger(ctx, R, inc):
+    """One or two sentences: the most likely trigger of this incident, from the evidence collected around it."""
+    out, lead = [], inc["lead"]
+    oom = next((e for e in inc["events"] if e["kind"] == "oom" and e.get("holders") and e.get("snap_total_kb")), None)
+    if oom:
+        kind, owner, kb = oom["holders"][0]
+        out.append("memory was held mainly by %s (%.0f%% of process memory, %s) when the kernel killed a process"
+                   % (owner_label(ctx, kind, owner), pct(kb, oom["snap_total_kb"]), fmt_kb(kb)))
+    elif inc["before"] and (inc["before"][1] >= 85 or inc["before"][2] >= 90):
+        b = inc["before"]
+        top = b[4][0] if b[1] >= 85 and b[4] else (b[5][0] if b[5] else None)
+        out.append("the server was already at %.0f%% CPU / %.0f%% memory%s"
+                   % (b[1], b[2], ", led by %s" % owner_label(ctx, top[0][0], top[0][1]) if top else ""))
+    if lead.get("php") and lead["php_cpu"] >= 30:
+        n, req, cpu, slow = lead["php"][0]
+        if pct(cpu, lead["php_cpu"]) >= 50:
+            uri = next((u for u in lead["uris"] if u[0] == n), None)
+            out.append("%s used %.0f%% of all PHP CPU in the lead-up (%s requests, %d slow)%s"
+                       % (n, pct(cpu, lead["php_cpu"]), fmt_num(req), slow,
+                          "; heaviest URL %s (%s hits, %.1f s avg)" % (trunc(uri[1], 50), fmt_num(uri[2]), uri[4]) if uri else ""))
+    if lead.get("ratio", 0) >= 3 and lead.get("req", 0) >= 300:
+        out.append("traffic was %.1fx the window average" % lead["ratio"])
+    if lead.get("sql_n", 0) >= 5:
+        out.append("%d slow queries ran in the lead-up%s" % (lead["sql_n"], " (mostly %s)" % lead["sql"][0][0] if lead["sql"] else ""))
+    for cat in ("php-memory", "db", "upstream-timeout"):
+        if cat in inc["errlog"]:
+            n, c = inc["errlog"][cat][0]
+            out.append("%s on %s (%d)" % (ERR_LABEL[cat][0], n, sum(x[1] for x in inc["errlog"][cat])))
+    if not out:
+        if inc["kinds"] == ["reboot"]:
+            return "No cause inside the OS - the reboot was started from outside (platform action, manual restart or provider event)."
+        if inc["kinds"] == ["errors"]:
+            return "Application-level errors with no server event - check the application error log for that time."
+        return "No clear trigger in the logs around this time."
+    text = "; ".join(out[:3])
+    return text[0].upper() + text[1:] + "."
 
 
 # ----------------------------------------------------------------------------
@@ -1547,6 +1906,13 @@ def scan_mysql_slowlog(ctx, my, start, end):
             d["time"] += cur["qt"]
             d["max"] = max(d["max"], cur["qt"])
             d["hours"][ts.strftime(HOUR_KEY)] += 1
+            wi = ctx.watch.get(ts.strftime(MINUTE_KEY))
+            if wi is not None:
+                dd = ctx.inc_detail[wi]
+                dd["sql_n"] += 1
+                qq = dd["sql"][(db, fp)]
+                qq[0] += 1
+                qq[1] += cur["qt"]
             res["total"] += 1
             res["by_day"][ts.strftime("%Y-%m-%d")] += 1
             res["by_hour"][ts.strftime("%Y-%m-%d %H")] += 1
@@ -1952,6 +2318,27 @@ def analyze(ctx, R):
     if el["crashed_tables"]:
         F.append(finding("warning", "Tables marked as crashed: " + ", ".join(list(el["crashed_tables"])[:5]), [],
                          "Repair the tables; crashed tables commonly follow an unclean MariaDB kill.", "db-tables"))
+    # --- Error logs
+    er = R["errors"]
+
+    def err_rows(cat):
+        return sorted(((n, e["counts"][cat]) for n, e in er["per_app"].items() if e["counts"][cat]), key=lambda x: -x[1])
+    for cat, minimum, tag, action in (
+            ("php-memory", 5, "app", "Find the code path that needs the memory (see the messages in the error-log "
+                                     "section) before raising memory_limit."),
+            ("php-timeout", 10, "app", "Profile the slow scripts; long-running jobs belong in WP-CLI/cron, not in web requests."),
+            ("db", 5, "db-conn", "Match the times against database restarts and OOM kills; check max_connections usage."),
+            ("upstream-timeout", 20, "app", "Requests waited longer than the proxy timeout - fix slow PHP/SQL on these apps."),
+            ("upstream-down", 20, "backend", "The backend refused or dropped connections - match against service restarts."),
+            ("php-fatal", 50, "app-errors", "Fix the fatal errors (see messages); each one is a failed request.")):
+        rows = err_rows(cat)
+        total = sum(c for _, c in rows)
+        if total >= minimum:
+            F.append(finding("warning", "%s: %s time(s) in the error logs" % (ERR_LABEL[cat][0], fmt_num(total)),
+                             ["%s: %s" % (owner_label(ctx, "app", n), fmt_num(c)) for n, c in rows[:4]], action, tag))
+    if er["apache_workers"]:
+        F.append(finding("warning", "[INTERNAL] Apache reached its worker limit %d time(s)" % er["apache_workers"], [],
+                         "Requests queued at the web server; usually a symptom of slow PHP holding workers.", "apache-workers"))
     # --- Traffic
     tr = R["traffic"]
     A["traffic"] = traffic_assessment(ctx, R)
@@ -2037,6 +2424,12 @@ def analyze(ctx, R):
     if "fpm" in tags and not any("PHP-FPM" in x for x in opt):
         opt.append("Resolve PHP worker exhaustion on %s by fixing slow execution before raising pm.max_children."
                    % ", ".join(ctx.apps.get(a, {}).get("domain") or a for a, _ in mc[:3]))
+    mem_rows = err_rows("php-memory")
+    if sum(c for _, c in mem_rows) >= 5:
+        comp = er["per_app"][mem_rows[0][0]]["components"]
+        opt.append("Fix PHP memory exhaustion on %s (%s errors%s): find the code path that needs the memory before "
+                   "raising memory_limit." % (ctx.apps.get(mem_rows[0][0], {}).get("domain") or mem_rows[0][0],
+                                              fmt_num(sum(c for _, c in mem_rows)), ", mostly in %s" % comp[0][0] if comp else ""))
     if ta["strong"] or (ta["signals"] and ta["rate5"] >= 5):
         opt.append("Rate-limit abusive clients / aggressive bots at the edge (Cloudflare, bot protection, wp-login and xmlrpc rules).")
     if "Filesystem" in cfg_text:
@@ -2088,6 +2481,11 @@ def incident_hours(R, o):
     hrs.update(r["ts"].strftime(HOUR_KEY) for r in R["reboots"])
     hrs.update(e["ts"].strftime(HOUR_KEY) for e in R["sys"]["svc_events"])
     hrs.update(t.strftime(HOUR_KEY) for t in R["mysql_err"]["startups"])
+    for inc in R.get("incidents", {}).get("list", []):
+        t = inc["start"].replace(minute=0, second=0, microsecond=0)
+        while t <= inc["end"] and len(hrs) < 2000:
+            hrs.add(t.strftime(HOUR_KEY))
+            t += timedelta(hours=1)
     tr = R["traffic"]
     for hk, c in tr["hour_5xx"].items():
         if c >= 20 and pct(c, tr["hour_req"].get(hk, 0)) >= 10:
@@ -2392,6 +2790,13 @@ def customer_findings(ctx, R, A):
     restarts = len(R["mysql_err"]["startups"])
     if restarts:
         out.append("The database service restarted %d time(s) during the period." % restarts)
+    for cat in ("php-memory", "php-timeout", "php-fatal", "db", "upstream-timeout", "upstream-down"):
+        rows = sorted(((n, e["counts"][cat]) for n, e in R["errors"]["per_app"].items() if e["counts"][cat]), key=lambda x: -x[1])
+        if rows:
+            comp = R["errors"]["per_app"][rows[0][0]]["components"] if cat.startswith("php") else []
+            out.append("Error logs: %s %s time(s), mostly on %s%s." % (
+                ERR_LABEL[cat][1], fmt_num(sum(c for _, c in rows)), dom(rows[0][0]),
+                " (source: %s)" % comp[0][0] if comp else ""))
     if ta["req"]:
         out.append("Traffic: %s requests were served, %.1f%% of them with server errors (5xx). %s"
                    % (fmt_num(ta["req"]), ta["rate5"], ta["ddos"].replace(" (see signals)", "")))
@@ -2452,7 +2857,7 @@ class Report:
             col = {"critical": "red", "warning": "yellow", "ok": "green", "info": "cyan"}[sev]
             tag = self.c("[%s] " % sev.upper(), col)
         pad = " " * (2 + 4 * level)
-        lines = textwrap.wrap(t, WIDTH - len(pad) - 2 - (len(sev) + 3 if sev else 0)) or [""]
+        lines = textwrap.wrap(t, WIDTH - len(pad) - 2 - (len(sev) + 3 if sev else 0), break_on_hyphens=False) or [""]
         self.out.append("%s%s %s%s" % (pad, "•" if self.box else "-", tag, self.hl(lines[0])))
         self.out += ["%s    %s" % (pad, self.hl(l)) for l in lines[1:]]
 
@@ -2605,6 +3010,156 @@ class HtmlReport(Report):
                 % (html.escape(self.doc_title), HTML_CSS, "\n".join(self.out)))
 
 
+INCIDENT_TYPES = (("oom", "Out of memory"), ("reboot", "Reboot"), ("service", "Service failure"),
+                  ("db-restart", "Database restart"), ("errors", "5xx burst"))
+
+
+def incident_type(inc):
+    return " + ".join(lbl for k, lbl in INCIDENT_TYPES if k in inc["kinds"])
+
+
+def incident_span(inc):
+    a, b = inc["start"], inc["end"]
+    if inc["impact_from"]:
+        a = min(a, datetime.strptime(inc["impact_from"], MINUTE_KEY))
+        b = max(b, datetime.strptime(inc["impact_to"], MINUTE_KEY) + timedelta(seconds=59))
+    return a, b
+
+
+def render_incidents(d, ctx, R):
+    """Phase 1: every outage as its own event - what happened, what led to it, the impact."""
+    I = R["incidents"]
+    incs = I["list"]
+    if not incs:
+        d.bullet("No incident found: no OOM kill, reboot, service failure, database restart or burst of 5xx errors "
+                 "in the window.", "ok" if R["sys"]["checked"] else "info")
+        return
+    d.kv([("Incidents", "%d (%d with measurable impact in the web logs)" % (I["count"], I["measured"])),
+          ("Estimated impact", "%s in total, %s error responses (5xx) served during incidents" % (fmt_dur(I["impact_s"]), fmt_num(I["errors"]))),
+          ("Pattern", I["recurring"] or None)])
+    rows = []
+    for inc in incs[:30]:
+        a, b = incident_span(inc)
+        rows.append([inc["id"], a.strftime("%m-%d %H:%M"), b.strftime("%H:%M" if a.date() == b.date() else "%m-%d %H:%M"),
+                     fmt_dur(inc["impact_s"]) + ("" if inc["measured"] else "*"), incident_type(inc), len(inc["events"]),
+                     fmt_num(inc["errors"]), ", ".join(n for n, _ in inc["apps"][:3]) or ("server-wide" if not inc.get("burst") else "-")])
+    d.table(["#", "Start", "End", "Impact (est.)", "Type", "Events", "5xx", "Applications hit"], rows,
+            align=["r", "l", "l", "r", "l", "r", "r", "l"], maxw=[0, 0, 0, 0, 34, 0, 0, 34])
+    d.text("Impact = minutes in which the web logs show an abnormal share of 5xx errors around the incident. "
+           "'*' = no error burst was recorded, so the time between the first and last event is shown instead."
+           + (" Showing the first 30 of %d." % len(incs) if len(incs) > 30 else ""))
+    detail = sorted(sorted(incs, key=lambda i: (-i["errors"], -len(i["events"])))[:8], key=lambda i: i["start"])
+    for inc in detail:
+        a, b = incident_span(inc)
+        d.h3("Incident #%d - %s to %s - %s" % (inc["id"], a.strftime("%Y-%m-%d %H:%M"), b.strftime("%H:%M"), incident_type(inc)))
+        ev = inc["events"]
+        d.bullet("Events: " + "; ".join("%s %s" % (e["ts"].strftime("%H:%M:%S"), e["label"]) for e in ev[:5])
+                 + (" ... +%d more" % (len(ev) - 5) if len(ev) > 5 else ""))
+        bf = inc["before"]
+        if bf:
+            d.bullet("Just before (atop %s): CPU %.0f%%, memory %.0f%%, swap %s. Top CPU: %s. Top memory: %s."
+                     % (bf[0].strftime("%H:%M"), bf[1], bf[2], fmt_kb(bf[3]),
+                        ", ".join("%s %.0f%%" % (owner_label(ctx, k[0], k[1]), v) for k, v in bf[4]) or "-",
+                        ", ".join("%s %s" % (owner_label(ctx, k[0], k[1]), fmt_kb(v)) for k, v in bf[5]) or "-"))
+        oom = next((e for e in ev if e["kind"] == "oom" and e.get("holders")), None)
+        if oom:
+            d.bullet("Memory holders at the kill (kernel report): "
+                     + ", ".join("%s %s" % (owner_label(ctx, k, o), fmt_kb(kb)) for k, o, kb in oom["holders"]))
+        ld = inc["lead"]
+        if ld.get("req"):
+            ip = ld["top_ip"][0] if ld["top_ip"] else None
+            d.bullet("Traffic (%d min before to the end): %s requests (%.1fx the window average), %s 5xx. Busiest: %s.%s"
+                     % (LEAD_MIN, fmt_num(ld["req"]), ld["ratio"], fmt_num(ld["s5"]),
+                        ", ".join("%s %s" % (n, fmt_num(c)) for n, c in ld["apps"]),
+                        " Top IP %s (%s)." % (ip[0], fmt_num(ip[1])) if ip else ""))
+        if ld.get("php"):
+            d.bullet("PHP in the lead-up: " + ", ".join("%s %.0f CPU-s (%.0f%%, %s req, %d slow)" % (
+                n, cpu, pct(cpu, ld["php_cpu"]), fmt_num(req), slow) for n, req, cpu, slow in ld["php"]))
+            for n, u, hits, cpu, avg in ld["uris"]:
+                d.bullet("%s %s - %s hits, %.0f CPU-s, %.1f s avg" % (n, trunc(u, 56), fmt_num(hits), cpu, avg), level=1)
+        if ld.get("sql_n"):
+            d.bullet("Slow queries in the lead-up: %d. %s" % (ld["sql_n"], "; ".join(
+                "%s x%d (%.0f s): %s" % (db, c, t, trunc(fp, 70)) for db, fp, c, t in ld["sql"])))
+        if inc["errlog"]:
+            d.bullet("Error logs: " + "; ".join("%s - %s" % (ERR_LABEL[cat][0], ", ".join("%s %d" % x for x in v))
+                                                for cat, v in sorted(inc["errlog"].items())))
+        if inc["max_children"]:
+            d.bullet("PHP worker limit (max_children) reached: " + ", ".join("%s %d" % x for x in inc["max_children"]))
+        if inc["apps"]:
+            d.bullet("Impact: %s, %s error responses; %s." % (fmt_dur(inc["impact_s"]), fmt_num(inc["errors"]),
+                                                              ", ".join("%s %s" % (n, fmt_num(c)) for n, c in inc["apps"][:4])))
+        d.bullet("Likely trigger: " + inc["trigger"], "warning")
+    if len(incs) > len(detail):
+        d.text("Details are shown for the %d incidents with the largest impact." % len(detail))
+
+
+def render_downtime(d, ctx, R):
+    """Phase 2: customer-safe downtime summary and per-website impact."""
+    I, tr = R["incidents"], R["traffic"]["per_app"]
+
+    def dom(name):
+        return ctx.apps.get(name, {}).get("domain") or name
+    incs = I["list"]
+    if not incs and not R["sys"]["checked"]:
+        d.bullet("No burst of server errors was found in the web server logs. The system logs could not be read, so "
+                 "memory events and restarts are not covered yet.")
+        return
+    if not incs:
+        d.bullet("No outage was identified in the period: no out-of-memory event, restart, service failure or burst "
+                 "of server errors.")
+        return
+    d.text("%d incident(s) were identified, with an estimated total impact of %s. During these incidents %s requests "
+           "were answered with a server error." % (I["count"], fmt_dur(I["impact_s"]), fmt_num(I["errors"])))
+    rows = []
+    for inc in incs[:20]:
+        a, b = incident_span(inc)
+        what = []
+        for e in inc["events"]:
+            if e["cust"] not in what:
+                what.append(e["cust"])
+        sites = [dom(n) for n, _ in inc["apps"]]
+        rows.append([inc["id"], a.strftime("%b %d %H:%M"), b.strftime("%H:%M" if a.date() == b.date() else "%b %d %H:%M"),
+                     fmt_dur(inc["impact_s"]) + ("" if inc["measured"] else "*"), "; ".join(what[:3]),
+                     (", ".join(sites[:2]) + (" +%d more" % (len(sites) - 2) if len(sites) > 2 else "")) if sites
+                     else ("All websites (brief)" if not inc.get("burst") else "-"), fmt_num(inc["errors"])])
+    d.table(["#", "Started", "Ended", "Impact (est.)", "What happened", "Websites affected", "Errors served"], rows,
+            align=["r", "l", "l", "r", "l", "l", "r"], maxw=[0, 0, 0, 0, 58, 40, 0])
+    d.text("Times are server time (%s). The impact is estimated from the error responses recorded in the web server "
+           "logs. '*' = no error responses were recorded, so the interruption was brief; the time between the first "
+           "and last event is shown.%s" % (TZ_NAME, " The first 20 of %d incidents are listed." % len(incs) if len(incs) > 20 else ""))
+    sites = sorted(I["sites"].items(), key=lambda kv: -kv[1]["errors"])
+    if sites:
+        d.text("Impact per website:")
+        d.table(["Website", "Incidents", "Errors during incidents", "Requests (period)", "Errors (period)", "Error rate"],
+                [[dom(n), v["incidents"], fmt_num(v["errors"]), fmt_num(tr[n]["req"]), fmt_num(tr[n]["s5"]),
+                  "%.2f%%" % pct(tr[n]["s5"], tr[n]["req"])] for n, v in sites[:10] if n in tr],
+                align=["l", "r", "r", "r", "r", "r"], maxw=[40, 0, 0, 0, 0, 0])
+
+
+def render_error_logs(d, ctx, R, top):
+    er = R["errors"]
+    if not er["per_app"] and not er["apache_workers"]:
+        d.bullet("No memory-limit, fatal, timeout or database-connection errors found in the application error logs "
+                 "for the window (or the logs are unreadable).", "ok")
+        return
+    cats = [c[0] for c in ERR_CATS]
+    names = sorted(er["per_app"], key=lambda n: -sum(er["per_app"][n]["counts"].values()))
+    d.table(["Application", "Domain", "PHP memory", "PHP timeout", "DB conn", "PHP fatal", "Timeouts 504", "Backend 502/503", "Rate-limited"],
+            [[n, trunc(ctx.apps.get(n, {}).get("domain", ""), 28)] + [fmt_num(er["per_app"][n]["counts"][c]) for c in cats]
+             for n in names[:top]], align=["l", "l"] + ["r"] * 7)
+    for n in names[:min(top, 5)]:
+        e = er["per_app"][n]
+        if not (e["messages"] or e["components"]):
+            continue
+        d.h3("%s (%s)" % (n, ctx.apps.get(n, {}).get("domain") or "no domain"))
+        if e["components"]:
+            d.text("Source of the PHP errors: " + ", ".join("%s (%d)" % kv for kv in e["components"]))
+        for msg, c in e["messages"]:
+            d.bullet("%dx %s" % (c, msg), level=1)
+    if er["apache_workers"]:
+        d.bullet("[INTERNAL] Apache logged 'MaxRequestWorkers reached' %d time(s) in the window." % er["apache_workers"], "warning")
+
+
 def render_customer_slow(d, ctx, R, A):
     """Customer-safe list of slow PHP requests and slow database queries, matched against the incident hours."""
     inc = set(A["incident_hours"])
@@ -2741,6 +3296,9 @@ def build_report(ctx, R, color=False, d=None):
         ("Incidents", "%s OOM kill(s) | %d reboot(s) | %d service failure event(s) | %d FPM max_children hit(s) | %s slow queries"
          % (o["total"] if R["sys"]["checked"] else "?", len(R["reboots"]), len(R["sys"]["svc_events"]), fpm_hits,
             fmt_num(R["mysql_slow"]["total"]))),
+        ("Downtime (est.)", "%d incident(s), about %s of impact, %s error responses served"
+         % (R["incidents"]["count"], fmt_dur(R["incidents"]["impact_s"]), fmt_num(R["incidents"]["errors"]))
+         if R["incidents"]["count"] else "no incident identified"),
         ("Resources", "CPU %.0f%% avg / %.0f%% peak | memory %.0f%% avg / %.0f%% peak | swap peak %s"
          % (at["cpu_avg"], at["cpu_peak"], at["mem_avg"], at["mem_peak"], fmt_kb(at["swap_peak_kb"])) if at else "no atop history"),
         ("Traffic", ("%s requests, %.2f%% 5xx. %s" % (fmt_num(A["traffic"]["req"]), A["traffic"]["rate5"], A["traffic"]["ddos"]))
@@ -2763,6 +3321,9 @@ def build_report(ctx, R, color=False, d=None):
 
     d.h2("TOP 3 APPLICATIONS BY CPU AND MEMORY (WITH TRAFFIC STATUS)")
     render_top_apps(d, ctx, A["top_apps"])
+
+    d.h2("INCIDENT BREAKDOWN (EACH OUTAGE, WHAT LED TO IT, IMPACT)")
+    render_incidents(d, ctx, R)
 
     d.h2("INVESTIGATION OVERVIEW")
     hours = (end - start).total_seconds() / 3600.0
@@ -3032,6 +3593,9 @@ def build_report(ctx, R, color=False, d=None):
     if rs:
         d.text("PHP-FPM master (re)starts per day: " + ", ".join("%s: %d" % kv for kv in sorted(rs.items())))
 
+    d.h2("APPLICATION AND WEB SERVER ERROR LOGS")
+    render_error_logs(d, ctx, R, top)
+
     # 9 ----------------------------------------------------------------------
     d.h2("MYSQL / MARIADB INVESTIGATION")
     my, sl, el = R["mysql"], R["mysql_slow"], R["mysql_err"]
@@ -3178,6 +3742,8 @@ def build_report(ctx, R, color=False, d=None):
     d.text(">>> BEGIN CUSTOMER RESPONSE >>>")
     d.h3("Summary")
     d.text(A["customer_short"])
+    d.h3("Downtime summary")
+    render_downtime(d, ctx, R)
     d.h3("What we found")
     for x in customer_findings(ctx, R, A):
         d.bullet(x)
@@ -3257,6 +3823,15 @@ def build_markdown(ctx, R):
         L += ["", "**Total OOM kills (window):** 0 | Reboots: %d" % len(R["reboots"])]
     else:
         L += ["No OOM kills and no atop history. Reboots: %d" % len(R["reboots"])]
+    if R["incidents"]["count"]:
+        I = R["incidents"]
+        L += ["", "---", "", "### Incidents (%d, about %s of impact, %s errors served)" % (I["count"], fmt_dur(I["impact_s"]), fmt_num(I["errors"])), "",
+              "| # | Start | Impact (est.) | Type | 5xx | Likely trigger |", "|---|-------|---------------|------|-----|----------------|"]
+        for inc in sorted(sorted(I["list"], key=lambda i: (-i["errors"], -len(i["events"])))[:10], key=lambda i: i["start"]):
+            L.append("| %d | %s | %s | %s | %s | %s |" % (inc["id"], incident_span(inc)[0].strftime("%b %d %H:%M"), fmt_dur(inc["impact_s"]),
+                                                     incident_type(inc), fmt_num(inc["errors"]), inc["trigger"].replace("|", "/")))
+        if I["recurring"]:
+            L += ["", I["recurring"]]
     if A["top_apps"]:
         L += ["", "---", "", "### Top applications (CPU / memory / traffic)", "",
               "| # | Application | CPU avg | CPU peak | Mem avg | Mem peak | Requests | 5xx | Traffic status |",
@@ -3326,11 +3901,6 @@ def investigate(ctx, start, end, how):
     R["sys"] = scan_system_logs(ctx, start, end)
     ctx.progress("  -> %d OOM kill(s), %d service event(s)" % (len(R["sys"]["oom"]), len(R["sys"]["svc_events"])))
     R["reboots"] = scan_reboots(ctx, start, end, R["base"]["boot"])
-    if args.skip_history:
-        R["atop"] = None
-    else:
-        ctx.progress("Reading atop history (%d day(s))" % len(day_list(start, end)))
-        R["atop"] = atop_history(ctx, start, end)
     ctx.progress("PHP-FPM master logs")
     R["fpm"] = scan_fpm_master_logs(ctx, start, end)
     if args.skip_mysql:
@@ -3338,12 +3908,19 @@ def investigate(ctx, start, end, how):
     else:
         ctx.progress("MySQL/MariaDB status, slow log and error log")
         R["mysql"] = mysql_collect(ctx)
-    R["mysql_slow"] = scan_mysql_slowlog(ctx, R["mysql"], start, end) if not args.skip_mysql else \
-        {"file": "", "enabled": "?", "long_query_time": "?", "total": 0, "by_db": {}, "by_day": Counter(), "by_hour": Counter(),
-         "fingerprints": [], "dumps": 0}
     R["mysql_err"] = scan_mysql_errorlog(ctx, R["mysql"], start, end) if not args.skip_mysql else \
         {"startups": [], "crash_recovery": 0, "too_many_conn": 0, "crashed_tables": Counter(), "oom": 0, "aborted": 0,
          "errors": Counter(), "files": 0}
+    # incidents are clustered now so the log scans below can record what happened just before each one
+    R["incidents_base"] = prepare_incidents(ctx, R)
+    R["mysql_slow"] = scan_mysql_slowlog(ctx, R["mysql"], start, end) if not args.skip_mysql else \
+        {"file": "", "enabled": "?", "long_query_time": "?", "total": 0, "by_db": {}, "by_day": Counter(), "by_hour": Counter(),
+         "fingerprints": [], "dumps": 0}
+    if args.skip_history:
+        R["atop"] = None
+    else:
+        ctx.progress("Reading atop history (%d day(s))" % len(day_list(start, end)))
+        R["atop"] = atop_history(ctx, start, end)
     deadline = time.time() + args.log_budget
     if args.skip_php:
         R["phpacc"], R["slow"] = {"per_app": {}, "hour_cpu": Counter()}, {}
@@ -3352,10 +3929,15 @@ def investigate(ctx, start, end, how):
         R["phpacc"] = scan_fpm_access(ctx, start, end, time.time() + args.log_budget / 2.0)
         R["slow"] = scan_slow_logs(ctx, start, end)
     if args.skip_traffic:
-        R["traffic"] = {"per_app": {}, "hour_req": Counter(), "hour_5xx": Counter(), "skipped": []}
+        R["traffic"] = {"per_app": {}, "hour_req": Counter(), "hour_5xx": Counter(), "skipped": [],
+                        "min_req": Counter(), "min_5xx": Counter()}
     else:
         ctx.progress("Web access logs per application (budget %.0fs)" % max(deadline - time.time(), 30))
         R["traffic"] = scan_traffic(ctx, start, end, max(deadline, time.time() + 30))
+    ctx.progress("Application error logs")
+    R["errors"] = scan_error_logs(ctx, start, end, max(deadline, time.time() + 30))
+    ctx.progress("Reconstructing incidents (%d event cluster(s))" % len(R["incidents_base"]))
+    R["incidents"] = finalize_incidents(ctx, R)
     ctx.progress("Configuration review")
     R["config"] = config_review(ctx, R["base"], R["mysql"], R["live"])
     ctx.progress("Correlating evidence and deciding root cause")

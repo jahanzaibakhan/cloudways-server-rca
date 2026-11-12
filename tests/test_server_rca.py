@@ -103,6 +103,21 @@ class Fixture:
             "[0x00007f0000000001] curl_exec() /home/1.cloudwaysapps.com/%s/public_html/wp-includes/Requests/Curl.php:10" % name,
             "[0x00007f0000000002] sync() /home/1.cloudwaysapps.com/%s/public_html/wp-content/plugins/heavy-plugin/sync.php:42" % name])
 
+    def add_error_logs(self, name):
+        d = os.path.join(self.apps, name, "logs")
+        ngx = (T0 + timedelta(seconds=30)).strftime("%Y/%m/%d %H:%M:%S")
+        apa = (T0 + timedelta(seconds=45)).strftime("[%a ") + MON[T0.month - 1] + (T0 + timedelta(seconds=45)).strftime(" %d %H:%M:%S.123456 %Y]")
+        old = (T0 - timedelta(days=20)).strftime("%Y/%m/%d %H:%M:%S")
+        self.write(os.path.join(d, "nginx-app.error.log"), [
+            '%s [error] 1#1: *9 upstream timed out (110: Connection timed out) while reading response header from upstream' % old,
+            '%s [error] 1#1: *7 access forbidden by rule, client: 127.0.0.1' % ngx] + [
+            '%s [error] 1#1: *%d upstream timed out (110: Connection timed out) while reading response header from upstream, '
+            'client: 203.0.113.9' % (ngx, i) for i in range(3)])
+        self.write(os.path.join(d, "backend_%s.error.log" % name), [
+            "%s [proxy_fcgi:error] [pid 9] [client 203.0.113.9:1] AH01071: Got error 'PHP message: PHP Fatal error:  Allowed "
+            "memory size of 268435456 bytes exhausted (tried to allocate 20480 bytes) in /home/1.cloudwaysapps.com/%s/"
+            "public_html/wp-content/plugins/heavy-plugin/sync.php on line 42', referer: https://x/" % (apa, name)] * 6)
+
     def add_syslog(self, kills=3):
         lines = []
         for i in range(kills):
@@ -262,6 +277,7 @@ class EndToEnd(unittest.TestCase):
         cls.path = os.environ["PATH"]
         cls.fx.add_app("shopapp", "shop.example.com")
         cls.fx.add_app("blogapp", "blog.example.com", requests=20, errors=0)
+        cls.fx.add_error_logs("shopapp")
         cls.fx.add_syslog()
         cls.fx.add_fpm_log("shopapp")
         cls.fx.add_fake_atop("shopapp")
@@ -300,15 +316,38 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("wp-content/plugins/heavy-plugin/sync.php:42", phase2)
         self.assertIn("During incidents", phase2)
 
+    def test_incident_breakdown_and_downtime(self):
+        sec = self.out.split("INCIDENT BREAKDOWN")[1].split("INVESTIGATION OVERVIEW")[0]
+        self.assertIn("Incident #1", sec)
+        self.assertIn("Out of memory", sec)
+        self.assertIn("OOM kill: mariadbd (server-wide)", sec)
+        self.assertIn("Likely trigger: Memory was held mainly by", sec)
+        self.assertIn("shopapp", sec)                                      # application hit by the errors
+        self.assertIn("PHP memory limit exhausted - shopapp 6", sec)       # error log matched to the incident
+        phase2 = self.out.split(">>> BEGIN CUSTOMER RESPONSE >>>")[1].split("<<< END CUSTOMER RESPONSE <<<")[0]
+        self.assertIn("Downtime summary", phase2)
+        self.assertIn("1 incident(s) were identified", phase2)
+        self.assertIn("Server ran out of memory; Database service restarted", phase2)
+        self.assertIn("Impact per website", phase2)
+        self.assertIn("PHP ran out of its memory limit 6 time(s), mostly on shop.example.com", phase2)
+
+    def test_error_logs(self):
+        sec = self.out.split("APPLICATION AND WEB SERVER ERROR LOGS")[1].split("MYSQL / MARIADB")[0]
+        self.assertIn("plugin:heavy-plugin (6)", sec)
+        self.assertIn("Allowed memory size of N bytes exhausted", sec)
+        row = [l for l in sec.splitlines() if l.startswith("  | shopapp")][0].split("|")
+        self.assertEqual([c.strip() for c in row[3:10]], ["6", "0", "0", "0", "3", "0", "0"])   # old line excluded
+
     def test_html_and_colour_output(self):
         out = tempfile.mkdtemp()
         try:
             frm = (T0 - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
-            code, text, err = run_main(["--from", frm, "--apps-root", self.fx.apps, "--skip-mysql", "--color", "--html",
+            code, text, err = run_main(["--from", frm, "--apps-root", self.fx.apps, "--skip-mysql", "--color", "--html", "--json",
                                         "--output-dir", out, "--quiet"])
             self.assertEqual(code, 0, err)
             self.assertIn("\033[", text)
-            page = open(os.path.join(out, [f for f in os.listdir(out) if f.endswith(".html")][0])).read()
+            with open(os.path.join(out, [f for f in os.listdir(out) if f.endswith(".html")][0])) as fh:
+                page = fh.read()
             self.assertIn('<div class="phase p2">', page)
             self.assertIn('<div class="customer">', page)
             self.assertNotIn("\033[", page)
