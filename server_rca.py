@@ -24,6 +24,7 @@ All times are server local time.
 import argparse
 import glob
 import gzip
+import html
 import json
 import os
 import pwd
@@ -38,7 +39,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 WIDTH = 100
 
 # ----------------------------------------------------------------------------
@@ -159,8 +160,14 @@ CUSTOMER_NAME = {
     "php-fpm": "PHP application processes", "other": "background processes",
 }
 SEV_ORDER = {"critical": 0, "warning": 1, "info": 2, "ok": 3}
-ANSI = {"red": "\033[31m", "yellow": "\033[33m", "green": "\033[32m", "cyan": "\033[36m",
-        "bold": "\033[1m", "reset": "\033[0m"}
+ANSI = {"red": "\033[91m", "yellow": "\033[93m", "green": "\033[92m", "cyan": "\033[96m", "dim": "\033[2m",
+        "bold": "\033[1m", "reset": "\033[0m", "key": "\033[36m", "title": "\033[1;96m", "h2": "\033[1;96m",
+        "h3": "\033[1;93m", "th": "\033[1;97m", "bar1": "\033[1;97;44m", "bar2": "\033[1;30;42m"}
+HL_RE = re.compile(r"\[(?:Confirmed|Likely|Suspected|Unknown)\]|CRITICAL|RESTARTED INSIDE THE WINDOW|NON-ROOT|"
+                   r"Needs review|Elevated errors")
+HL_COLORS = {"[Confirmed]": "green", "CRITICAL": "red", "RESTARTED INSIDE THE WINDOW": "red"}
+CELL_COLORS = {"Normal": "green", "Needs review": "yellow", "Elevated errors": "yellow", "No data": "dim", "YES": "red"}
+HOUR_KEY = "%Y-%m-%d %H"
 
 
 # ----------------------------------------------------------------------------
@@ -1411,7 +1418,7 @@ def scan_slow_logs(ctx, start, end):
         files = [f for f in files_for_window(app["fpm_slow_logs"], start) if os.access(f, os.R_OK)]
         if not files:
             continue
-        traces, comps, funcs = 0, Counter(), Counter()
+        traces, comps, funcs, hours = 0, Counter(), Counter(), Counter()
         for f in files:
             active, got = False, False
             for line in iter_lines(f):
@@ -1420,7 +1427,9 @@ def scan_slow_logs(ctx, start, end):
                     ts = make_ts(h.group(3), h.group(2), h.group(1), h.group(4), h.group(5), h.group(6))
                     active = in_window(ts, start, end)
                     got = False
-                    traces += 1 if active else 0
+                    if active:
+                        traces += 1
+                        hours[ts.strftime(HOUR_KEY)] += 1
                     continue
                 if not active or got:
                     continue
@@ -1431,7 +1440,8 @@ def scan_slow_logs(ctx, start, end):
                     i = m.group(2).find("public_html/")
                     funcs["%s() %s:%s" % (m.group(1), m.group(2)[i + 12:] if i >= 0 else m.group(2), m.group(3))] += 1
         if traces:
-            per[name] = {"traces": traces, "components": comps.most_common(4), "functions": funcs.most_common(3)}
+            per[name] = {"traces": traces, "components": comps.most_common(4), "functions": funcs.most_common(3),
+                         "hours": hours}
     return per
 
 
@@ -1510,7 +1520,7 @@ def scan_mysql_slowlog(ctx, my, start, end):
     if files and not any(os.access(f, os.R_OK) for f in files):
         ctx.note("MySQL slow query log is not readable (run as root).")
         return res
-    fps, by_db = {}, defaultdict(lambda: {"count": 0, "time": 0.0, "max": 0.0})
+    fps, by_db = {}, defaultdict(lambda: {"count": 0, "time": 0.0, "max": 0.0, "hours": Counter()})
     for f in files:
         state = {"cur": None, "sql": [], "ts": None, "user": "", "schema": ""}
 
@@ -1536,6 +1546,7 @@ def scan_mysql_slowlog(ctx, my, start, end):
             d["count"] += 1
             d["time"] += cur["qt"]
             d["max"] = max(d["max"], cur["qt"])
+            d["hours"][ts.strftime(HOUR_KEY)] += 1
             res["total"] += 1
             res["by_day"][ts.strftime("%Y-%m-%d")] += 1
             res["by_hour"][ts.strftime("%Y-%m-%d %H")] += 1
@@ -2062,12 +2073,39 @@ def analyze(ctx, R):
     else:
         up = ("No", "", "No capacity-driven incident in this window.")
     A["upscale"] = up
+    A["incident_hours"] = incident_hours(R, o)
     A["top_apps"] = top_apps(ctx, R, 3)
     A["verdict"] = build_verdict(ctx, R, A, o)
     A["customer"] = customer_paragraph(ctx, R, A, o)
     A["customer_short"] = customer_paragraph(ctx, R, A, o, with_recs=False)
     R["analysis"] = A
     return A
+
+
+def incident_hours(R, o):
+    """Hours (YYYY-MM-DD HH) with an outage signal: OOM kills, reboots, service failures, DB restarts, 5xx bursts."""
+    hrs = set(o["by_hour"])
+    hrs.update(r["ts"].strftime(HOUR_KEY) for r in R["reboots"])
+    hrs.update(e["ts"].strftime(HOUR_KEY) for e in R["sys"]["svc_events"])
+    hrs.update(t.strftime(HOUR_KEY) for t in R["mysql_err"]["startups"])
+    tr = R["traffic"]
+    for hk, c in tr["hour_5xx"].items():
+        if c >= 20 and pct(c, tr["hour_req"].get(hk, 0)) >= 10:
+            hrs.add(hk)
+    return sorted(hrs)
+
+
+def traffic_floor(base):
+    """Requests/hour at which traffic starts to matter for a server of this size.
+
+    About 1,500 requests/hour per GB of RAM (minimum 3,000): 3,000 on 1-2 GB, 12,000 on 8 GB, 48,000 on 32 GB.
+    Below it, a busy hour, a prominent client or a high bot share cannot load the server and is not flagged.
+    """
+    try:
+        ram = float(base.get("ram_gb") or 0)
+    except (TypeError, ValueError):
+        ram = 0.0
+    return int(max(3000, 1500 * ram))
 
 
 def traffic_assessment(ctx, R):
@@ -2080,24 +2118,32 @@ def traffic_assessment(ctx, R):
     median = hours[len(hours) // 2] if hours else 0
     peak = tr["hour_req"].most_common(1)[0] if tr["hour_req"] else ("", 0)
     own = set(R["base"]["ips"]) | {"127.0.0.1", "::1"}
+    window_h = max((R["meta"]["end"] - R["meta"]["start"]).total_seconds() / 3600.0, 0.02)
+    floor = traffic_floor(R["base"])
+    per_hour = req / window_h
+    level = "low" if per_hour < floor / 10.0 else ("moderate" if per_hour < floor else "high")
+    abuse = max(1000, floor // 10)
     signals = []
     for name, a in per.items():
-        if a["req"] < 2000:
-            continue
+        if a["login"] >= abuse:
+            signals.append("%s wp-login.php requests on %s (possible brute force)" % (fmt_num(a["login"]), name))
+        if a["xmlrpc"] >= abuse:
+            signals.append("%s xmlrpc.php requests on %s (possible abuse)" % (fmt_num(a["xmlrpc"]), name))
+        if a["req"] < 2000 or a["req"] / window_h < floor / 20.0:
+            continue        # too little volume to load a server of this size
         for ip, n in a["top_ips"][:2]:
             if ip not in own and pct(n, a["req"]) >= 25:
                 signals.append("Single IP %s sent %.0f%% of %s's requests (%s)" % (ip, pct(n, a["req"]), name, fmt_num(n)))
-        if a["login"] >= 1000:
-            signals.append("%s wp-login.php requests on %s (possible brute force)" % (fmt_num(a["login"]), name))
-        if a["xmlrpc"] >= 1000:
-            signals.append("%s xmlrpc.php requests on %s (possible abuse)" % (fmt_num(a["xmlrpc"]), name))
         if pct(a["bots"], a["req"]) >= 40:
             signals.append("Bots/tools are %.0f%% of %s's requests" % (pct(a["bots"], a["req"]), name))
-    spike = bool(median and peak[1] >= max(median * 6, 3000))
+    spike = bool(median and peak[1] >= max(median * 6, floor))
     strong = spike or any(("wp-login" in x or "xmlrpc" in x) for x in signals)
     if spike:
         signals.append("Traffic spike: %s requests in the hour %s:00 vs a median of %s/hour"
                        % (fmt_num(peak[1]), peak[0], fmt_num(median)))
+    size = ("a %s GB server" % R["base"]["ram_gb"]) if R["base"].get("ram_gb") else "this server"
+    volume = ("%s requests/day on average (%.2f per second) - %s for %s; traffic is only flagged from about %s "
+              "requests/hour" % (fmt_num(int(round(per_hour * 24))), per_hour / 3600.0, level, size, fmt_num(floor)))
     if not req:
         ddos = "Not assessed - no web access logs could be read for the window."
     elif spike and any("Single IP" in s for s in signals):
@@ -2107,9 +2153,10 @@ def traffic_assessment(ctx, R):
     elif signals:
         ddos = "No DDoS pattern; one client or bot group is prominent (see signals) - verify it is expected."
     else:
-        ddos = "No DDoS or attack pattern: traffic volume is steady and no client dominates."
+        ddos = "No DDoS or attack pattern: traffic volume is %s for %s and no client dominates." % (level, size)
     return {"req": req, "s5": s5, "rate5": pct(s5, req), "bots": bots, "bot_share": pct(bots, req), "median_hour": median,
-            "peak_hour": peak, "signals": signals[:8], "ddos": ddos, "spike": spike, "strong": strong}
+            "peak_hour": peak, "signals": signals[:8], "ddos": ddos, "spike": spike, "strong": strong,
+            "level": level, "floor": floor, "per_day": per_hour * 24, "volume": volume}
 
 
 def imunify_summary(ctx, R, o):
@@ -2226,23 +2273,26 @@ def app_traffic_status(ctx, R, name):
     hours = sorted(a["hours"].values())
     median = hours[len(hours) // 2]
     window_h = max((R["meta"]["end"] - R["meta"]["start"]).total_seconds() / 3600.0, 0.02)
+    floor = traffic_floor(R["base"])
+    busy = a["req"] >= 2000 and a["req"] / window_h >= floor / 20.0     # enough volume to matter on this server
+    abuse = max(1000, floor // 10)
     flags, errors = [], False
     if a["s5"] >= 20 and pct(a["s5"], a["req"]) >= 5:
         errors = True
         flags.append("%.0f%% of responses are 5xx errors" % pct(a["s5"], a["req"]))
-    if a["req"] >= 500 and pct(a["bots"], a["req"]) >= 40:
+    if busy and pct(a["bots"], a["req"]) >= 40:
         flags.append("%.0f%% of requests come from bots/tools" % pct(a["bots"], a["req"]))
     ext = [(ip, n) for ip, n in a["top_ips"] if ip not in own]
-    if a["req"] >= 2000 and ext and pct(ext[0][1], a["req"]) >= 25:
+    if busy and ext and pct(ext[0][1], a["req"]) >= 25:
         flags.append("one IP (%s) sends %.0f%% of requests" % (ext[0][0], pct(ext[0][1], a["req"])))
-    if a["login"] >= 1000:
+    if a["login"] >= abuse:
         flags.append("%s wp-login.php requests" % fmt_num(a["login"]))
-    if a["xmlrpc"] >= 1000:
+    if a["xmlrpc"] >= abuse:
         flags.append("%s xmlrpc.php requests" % fmt_num(a["xmlrpc"]))
-    if len(hours) >= 6 and a["peak_hour_req"] >= max(median * 6, 1000):
+    if len(hours) >= 6 and a["peak_hour_req"] >= max(median * 6, 1000, floor // 4):
         flags.append("spike of %s requests at %s:00 (median %s/hour)" % (fmt_num(a["peak_hour_req"]), a["peak_hour"], fmt_num(median)))
     status = "Normal" if not flags else ("Elevated errors" if errors and len(flags) == 1 else "Needs review")
-    return {"status": status, "flags": flags, "req": a["req"], "per_hour": a["req"] / window_h,
+    return {"status": status, "flags": flags, "req": a["req"], "per_hour": a["req"] / window_h, "floor": floor,
             "peak_hour": a["peak_hour"], "peak_hour_req": a["peak_hour_req"], "unique_ips": a["unique_ips"],
             "s5_pct": pct(a["s5"], a["req"]), "bot_pct": pct(a["bots"], a["req"]),
             "detail": "%s requests (%s/hour avg, peak %s at %s:00), %s IPs, 5xx %.1f%%, bots %.0f%%"
@@ -2332,6 +2382,9 @@ def customer_findings(ctx, R, A):
     if mc:
         out.append("The PHP worker limit was reached %d time(s) on %s, meaning requests had to wait for a free worker."
                    % (sum(c for _, c in mc), ", ".join(dom(a) for a, _ in mc[:3])))
+    slow5 = sum(v["slow5"] for v in R["phpacc"]["per_app"].values())
+    if slow5:
+        out.append("%s PHP requests took longer than 5 seconds to complete (details below)." % fmt_num(slow5))
     sl = R["mysql_slow"]
     if sl["total"] >= 20:
         dbs = [dom(db) for db in list(sl["by_db"])[:2] if db != "(unknown)"]
@@ -2346,35 +2399,52 @@ def customer_findings(ctx, R, A):
 
 
 class Report:
+    """Plain-text report. With color=True it adds ANSI colours and box-drawing tables for terminals."""
+
     def __init__(self, color=False):
         self.out, self.color, self.n = [], color, 0
+        self.box = color and "utf" in (getattr(sys.stdout, "encoding", "") or "").lower()
 
     def c(self, text, col):
         return "%s%s%s" % (ANSI[col], text, ANSI["reset"]) if self.color else text
 
+    def hl(self, text):
+        if not self.color:
+            return text
+        return HL_RE.sub(lambda m: self.c(m.group(0), HL_COLORS.get(m.group(0), "yellow")), text)
+
     def title(self, t):
-        self.out += ["", "=" * WIDTH, self.c(t.center(WIDTH), "bold"), "=" * WIDTH]
+        line = ("═" if self.box else "=") * WIDTH
+        self.out += ["", self.c(line, "title"), self.c(t.center(WIDTH), "title"), self.c(line, "title")]
 
     def h2(self, t):
         self.n += 1
-        self.out += ["", "-" * WIDTH, self.c("%d. %s" % (self.n, t), "bold"), "-" * WIDTH]
+        line = self.c(("─" if self.box else "-") * WIDTH, "dim")
+        self.out += ["", line, self.c("%d. %s" % (self.n, t), "h2"), line]
 
     def phase(self, t, sub):
-        self.out += ["", "#" * WIDTH, self.c(("  " + t).ljust(WIDTH), "bold"), "  " + sub, "#" * WIDTH]
+        if self.color:
+            bar = "bar2" if "PHASE 2" in t else "bar1"
+            self.out += [""] + [self.c(x.ljust(WIDTH), bar) for x in ("", "  " + t, "  " + sub, "")]
+        else:
+            self.out += ["", "#" * WIDTH, ("  " + t).ljust(WIDTH), "  " + sub, "#" * WIDTH]
 
     def h3(self, t):
-        self.out += ["", self.c("▸ " + t, "bold")]
+        self.out += ["", self.c("▸ " + t, "h3")]
 
     def kv(self, rows):
         rows = [(k, v) for k, v in rows if v not in (None, "")]
         w = max([len(k) for k, _ in rows] or [0])
         for k, v in rows:
             lines = textwrap.wrap(str(v), WIDTH - w - 6) or [""]
-            self.out.append("  %s : %s" % (k.ljust(w), lines[0]))
-            self.out += ["  %s   %s" % (" " * w, l) for l in lines[1:]]
+            self.out.append("  %s : %s" % (self.c(k.ljust(w), "key"), self.hl(lines[0])))
+            self.out += ["  %s   %s" % (" " * w, self.hl(l)) for l in lines[1:]]
 
     def text(self, t, indent=2):
-        self.out += textwrap.wrap(t, WIDTH - indent, initial_indent=" " * indent, subsequent_indent=" " * (indent + 2)) or [""]
+        lines = textwrap.wrap(t, WIDTH - indent, initial_indent=" " * indent, subsequent_indent=" " * (indent + 2)) or [""]
+        if t.startswith((">>> ", "<<< ")):
+            lines = [self.c(l, "green") for l in lines]
+        self.out += [self.hl(l) for l in lines]
 
     def bullet(self, t, sev=None, level=0):
         tag = ""
@@ -2383,8 +2453,8 @@ class Report:
             tag = self.c("[%s] " % sev.upper(), col)
         pad = " " * (2 + 4 * level)
         lines = textwrap.wrap(t, WIDTH - len(pad) - 2 - (len(sev) + 3 if sev else 0)) or [""]
-        self.out.append("%s- %s%s" % (pad, tag, lines[0]))
-        self.out += ["%s    %s" % (pad, l) for l in lines[1:]]
+        self.out.append("%s%s %s%s" % (pad, "•" if self.box else "-", tag, self.hl(lines[0])))
+        self.out += ["%s    %s" % (pad, self.hl(l)) for l in lines[1:]]
 
     def table(self, headers, rows, align=None, maxw=None):
         rows = [[str(x) for x in r] for r in rows]
@@ -2396,18 +2466,208 @@ class Report:
         if maxw:
             rows = [[trunc(x, maxw[i]) if maxw[i] else x for i, x in enumerate(r)] for r in rows]
         widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(n)]
+        bar = self.c("│" if self.box else "|", "dim")
 
-        def line(cells):
-            return "  | " + " | ".join(x.rjust(widths[i]) if align[i] == "r" else x.ljust(widths[i])
-                                      for i, x in enumerate(cells)) + " |"
-        sep = "  +" + "+".join("-" * (w + 2) for w in widths) + "+"
-        self.out += [sep, self.c(line(headers), "bold"), sep] + [line(r) for r in rows] + [sep]
+        def line(cells, head=False):
+            parts = []
+            for i, x in enumerate(cells):
+                cell = x.rjust(widths[i]) if align[i] == "r" else x.ljust(widths[i])
+                col = "th" if head else CELL_COLORS.get(x)
+                parts.append(self.c(cell, col) if col else cell)
+            return "  %s %s %s" % (bar, (" %s " % bar).join(parts), bar)
+
+        def sep(chars):
+            h = "─" if self.box else "-"
+            left, mid, right = chars if self.box else "+++"
+            return self.c("  " + left + mid.join(h * (w + 2) for w in widths) + right, "dim")
+        self.out += [sep("┌┬┐"), line(headers, True), sep("├┼┤")] + [line(r) for r in rows] + [sep("└┴┘")]
 
     def blank(self):
         self.out.append("")
 
     def render(self):
         return "\n".join(self.out) + "\n"
+
+
+HTML_CSS = """
+:root{--ink:#1c2434;--mute:#64708a;--line:#e3e7ef;--bg:#f4f6fa;--card:#fff;--p1:#2f4aa8;--p2:#147a4b;
+--red:#c62828;--amber:#b26a00;--green:#1b7f4a;--blue:#1f6fb5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",
+Inter,Roboto,"Helvetica Neue",Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 22px 60px}
+h1{font-size:26px;letter-spacing:.3px;margin:0 0 4px}
+.sub{color:var(--mute);margin:0 0 22px}
+.phase{color:#fff;border-radius:10px;padding:16px 20px;margin:34px 0 14px}
+.phase.p1{background:linear-gradient(90deg,#2f4aa8,#4666d2)}
+.phase.p2{background:linear-gradient(90deg,#147a4b,#22a567)}
+.phase .pt{font-size:19px;font-weight:700;letter-spacing:.4px}
+.phase .ps{opacity:.92;font-size:14px}
+h2{font-size:18px;margin:26px 0 10px;padding:9px 14px;background:var(--card);border:1px solid var(--line);
+border-left:5px solid var(--p1);border-radius:8px}
+h2 .num{display:inline-block;min-width:28px;color:var(--p1);font-weight:800}
+h3{font-size:15px;margin:20px 0 8px;color:#27314a;text-transform:uppercase;letter-spacing:.5px}
+p{margin:6px 0}
+.tw{overflow-x:auto;margin:8px 0 12px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
+table.data th{background:#eef1f8;text-align:left;font-weight:700;padding:8px 10px;border-bottom:2px solid var(--line);
+white-space:nowrap}
+table.data td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+table.data tr:nth-child(even) td{background:#fafbfd}
+table.data .r{text-align:right;white-space:nowrap}
+table.kv th{text-align:left;width:210px;color:var(--mute);font-weight:600;padding:7px 12px;vertical-align:top;
+border-bottom:1px solid var(--line);white-space:nowrap}
+table.kv td{padding:7px 12px;border-bottom:1px solid var(--line)}
+.b{margin:5px 0 5px 4px;padding-left:16px;position:relative}
+.b:before{content:"";position:absolute;left:2px;top:.62em;width:6px;height:6px;border-radius:50%;background:#9aa5bd}
+.b.l1{margin-left:34px;color:#3c465e;font-size:14px}
+.badge,.pill{display:inline-block;border-radius:20px;padding:1px 9px;font-size:11.5px;font-weight:700;
+letter-spacing:.4px;margin-right:6px;color:#fff}
+.critical,.k-red{background:var(--red)}.warning,.k-yellow{background:var(--amber)}
+.ok,.k-green{background:var(--green)}.info{background:var(--blue)}.k-dim{background:#8b95ab}
+.customer{background:var(--card);border:2px solid #22a567;border-radius:12px;padding:6px 22px 18px;margin:12px 0}
+.customer .tag{display:inline-block;background:#22a567;color:#fff;font-weight:700;font-size:12px;letter-spacing:.5px;
+border-radius:0 0 8px 8px;padding:3px 12px;margin-bottom:6px}
+code{font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media print{body{background:#fff}.phase{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+"""
+
+
+class HtmlReport(Report):
+    """Same report as a self-contained HTML page (fonts, colours, real tables). No external resources."""
+
+    def __init__(self, subtitle=""):
+        Report.__init__(self, False)
+        self.subtitle, self.doc_title = subtitle, "Server RCA"
+
+    def hl(self, text):
+        return HL_RE.sub(lambda m: '<span class="pill k-%s">%s</span>'
+                         % (HL_COLORS.get(m.group(0), "yellow"), m.group(0).strip("[]")), html.escape(str(text), quote=False))
+
+    def title(self, t):
+        self.doc_title = t
+        self.out.append("<h1>%s</h1>" % html.escape(t))
+        if self.subtitle:
+            self.out.append('<p class="sub">%s</p>' % html.escape(self.subtitle))
+
+    def h2(self, t):
+        self.n += 1
+        self.out.append('<h2><span class="num">%d</span>%s</h2>' % (self.n, html.escape(t)))
+
+    def phase(self, t, sub):
+        self.out.append('<div class="phase %s"><div class="pt">%s</div><div class="ps">%s</div></div>'
+                        % ("p2" if "PHASE 2" in t else "p1", html.escape(t), html.escape(sub)))
+
+    def h3(self, t):
+        self.out.append("<h3>%s</h3>" % html.escape(t))
+
+    def kv(self, rows):
+        rows = [(k, v) for k, v in rows if v not in (None, "")]
+        self.out.append('<div class="tw"><table class="kv">%s</table></div>'
+                        % "".join("<tr><th>%s</th><td>%s</td></tr>" % (html.escape(k), self.hl(v)) for k, v in rows))
+
+    def text(self, t, indent=2):
+        if t.startswith(">>> BEGIN CUSTOMER"):
+            self.out.append('<div class="customer"><div class="tag">CUSTOMER RESPONSE - SAFE TO SHARE</div>')
+        elif t.startswith("<<< END CUSTOMER"):
+            self.out.append("</div>")
+        else:
+            self.out.append("<p>%s</p>" % self.hl(t))
+
+    def bullet(self, t, sev=None, level=0):
+        badge = '<span class="badge %s">%s</span>' % (sev, sev.upper()) if sev else ""
+        self.out.append('<div class="b l%d">%s%s</div>' % (min(level, 1), badge, self.hl(t)))
+
+    def table(self, headers, rows, align=None, maxw=None):
+        if not rows:
+            self.out.append("<p>(no data)</p>")
+            return
+        align = align or (["l"] + ["r"] * (len(headers) - 1))
+        body = []
+        for r in rows:
+            cells = []
+            for i, x in enumerate(r):
+                x = str(x)
+                inner = '<span class="pill k-%s">%s</span>' % (CELL_COLORS[x], x) if x in CELL_COLORS else html.escape(x, quote=False)
+                cells.append('<td%s>%s</td>' % (' class="r"' if align[i] == "r" else "", inner))
+            body.append("<tr>%s</tr>" % "".join(cells))
+        head = "".join('<th%s>%s</th>' % (' class="r"' if align[i] == "r" else "", html.escape(h)) for i, h in enumerate(headers))
+        self.out.append('<div class="tw"><table class="data"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+                        % (head, "".join(body)))
+
+    def blank(self):
+        pass
+
+    def render(self):
+        return ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                "<title>%s</title><style>%s</style></head>\n<body><div class=\"wrap\">\n%s\n</div></body></html>\n"
+                % (html.escape(self.doc_title), HTML_CSS, "\n".join(self.out)))
+
+
+def render_customer_slow(d, ctx, R, A):
+    """Customer-safe list of slow PHP requests and slow database queries, matched against the incident hours."""
+    inc = set(A["incident_hours"])
+    pa, slow, sl = R["phpacc"]["per_app"], R["slow"], R["mysql_slow"]
+
+    def dom(name):
+        return ctx.apps.get(name, {}).get("domain") or name
+    php = []
+    for n in set(pa) | set(slow):
+        v, t = pa.get(n), slow.get(n)
+        if not ((v and v["slow5"]) or t):
+            continue
+        during = sum(c for hk, c in t["hours"].items() if hk in inc) if t else 0
+        php.append((during, v["slow5"] if v else 0, t["traces"] if t else 0, n, v, t))
+    php.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+    dbs = sorted(((sum(c for hk, c in v["hours"].items() if hk in inc), v["time"], db, v) for db, v in sl["by_db"].items()),
+                 key=lambda x: (-x[0], -x[1]))
+    if not php and not dbs:
+        d.bullet("No slow PHP requests or slow database queries were recorded in the period.")
+        return
+    if inc:
+        d.text("%d incident hour(s) were identified in the period (out-of-memory events, restarts, service failures "
+               "or bursts of server errors). 'During incidents' counts the slow activity recorded inside those hours."
+               % len(inc))
+    else:
+        d.text("No outage window was identified in the period, so the heaviest slow operations are listed for reference.")
+    if php:
+        d.h3("Slow PHP requests")
+        d.table(["Website", "Requests >= 5s", "Requests >= 30s", "Slowest (s)", "Slow-log entries", "During incidents", "Main source"],
+                [[dom(n), fmt_num(v["slow5"]) if v else "-", fmt_num(v["slow30"]) if v else "-",
+                  "%.0f" % v["max_dur"] if v else "-", t["traces"] if t else 0, during if inc else "-",
+                  t["components"][0][0] if t and t["components"] else "-"] for during, _, _, n, v, t in php[:5]],
+                align=["l", "r", "r", "r", "r", "r", "l"], maxw=[34, 0, 0, 0, 0, 0, 30])
+        for during, _, _, n, v, t in php[:3]:
+            for fn, c in (t["functions"] if t else []):
+                d.bullet("%s: %s - seen in %d slow request(s)" % (dom(n), fn, c))
+            for u, hits, cpu, avg in (v.get("top_uris", [])[:3] if v else []):
+                if avg >= 1:
+                    d.bullet("%s: %s - %s request(s), %.1f s on average" % (dom(n), trunc(u, 60), fmt_num(hits), avg))
+    if dbs:
+        d.h3("Slow database queries")
+        d.table(["Website / database", "Slow queries", "Total time (s)", "Longest (s)", "During incidents"],
+                [[dom(db), fmt_num(v["count"]), "%.0f" % v["time"], "%.1f" % v["max"], during if inc else "-"]
+                 for during, _, db, v in dbs[:5]], align=["l", "r", "r", "r", "r"], maxw=[40, 0, 0, 0, 0])
+        d.text("Slowest queries (values masked):")
+        d.table(["Website / database", "Count", "Total s", "Longest s", "Rows examined", "Query"],
+                [[dom(a["db"]), a["count"], "%.0f" % a["time"], "%.1f" % a["max"], fmt_num(a["rows_ex"] // a["count"]), a["fp"]]
+                 for a in sl["fingerprints"][:5]], align=["l", "r", "r", "r", "r", "l"], maxw=[26, 0, 0, 0, 0, 50])
+    if inc:
+        tr_all, tr_in = sum(x[2] for x in php), sum(x[0] for x in php)
+        q_all, q_in = sl["total"], sum(x[0] for x in dbs)
+        parts = []
+        if q_all:
+            parts.append("%s of %s slow database queries (%.0f%%)" % (fmt_num(q_in), fmt_num(q_all), pct(q_in, q_all)))
+        if tr_all:
+            parts.append("%s of %s slow PHP log entries (%.0f%%)" % (fmt_num(tr_in), fmt_num(tr_all), pct(tr_in, tr_all)))
+        if parts:
+            share = pct(q_in + tr_in, q_all + tr_all)
+            d.text("%s were recorded during the incident hours. %s" % (
+                " and ".join(parts),
+                "This slow activity coincided with the outages and is the first thing to optimise." if share >= 30 else
+                "Most of the slow activity happened outside the incident hours, so it is a general performance "
+                "concern rather than the direct trigger of the outages."))
 
 
 def render_top_apps(d, ctx, rows, customer=False):
@@ -2445,14 +2705,18 @@ def render_top_apps(d, ctx, rows, customer=False):
                        "%.0f%%" % t["bot_pct"], t["status"]])
     d.table(["#", "Website" if customer else "Application", "Requests", "Per hour", "Peak hour", "5xx", "Bots", "Traffic status"],
             tr, align=["r", "l", "r", "r", "r", "r", "r", "l"])
+    floor = next((r["traffic"]["floor"] for r in rows if "floor" in r["traffic"]), None)
+    if floor and not customer:
+        d.text("Traffic status is judged against the server size: on this server a spike, a dominant client or a "
+               "high bot share is only flagged from about %s requests/hour." % fmt_num(floor))
     for i, r in enumerate(rows, 1):
         d.bullet("%d. %s: %s" % (i, label(r), r["insight"]))
         for f in r["traffic"]["flags"]:
             d.bullet("Traffic: " + f, level=1)
 
 
-def build_report(ctx, R, color=False):
-    d = Report(color)
+def build_report(ctx, R, color=False, d=None):
+    d = d or Report(color)
     meta, base, A, o = R["meta"], R["base"], R["analysis"], R["oom"]
     at, cfg, live, top = R.get("atop"), R["config"], R["live"], ctx.args.top
     start, end = meta["start"], meta["end"]
@@ -2812,6 +3076,7 @@ def build_report(ctx, R, color=False):
         d.bullet("No web access log data for the window (logs missing, unreadable or --skip-traffic).", "info")
     else:
         d.kv([("Total requests", "%s across %d application(s)" % (fmt_num(ta["req"]), len(tr["per_app"]))),
+              ("Volume", ta["volume"]),
               ("5xx responses", "%s (%.2f%%)" % (fmt_num(ta["s5"]), ta["rate5"])),
               ("Bot / tool share", "%.0f%%" % ta["bot_share"]),
               ("Busiest hour", "%s:00 with %s requests (median hour %s)" % (ta["peak_hour"][0], fmt_num(ta["peak_hour"][1]), fmt_num(ta["median_hour"]))),
@@ -2918,6 +3183,8 @@ def build_report(ctx, R, color=False):
         d.bullet(x)
     d.h3("Top applications by CPU and memory usage (with traffic status)")
     render_top_apps(d, ctx, A["top_apps"], customer=True)
+    d.h3("Slow PHP requests and database queries (supporting evidence)")
+    render_customer_slow(d, ctx, R, A)
     recs = [x for x in A["optimizations"] if not x.startswith("[INTERNAL]") and not x.startswith("No change")]
     d.h3("Recommendations")
     for k, x in enumerate(recs, 1):
@@ -3035,6 +3302,8 @@ def build_parser():
     ap.add_argument("--save", action="store_true", help="Save the report to --output-dir")
     ap.add_argument("--json", action="store_true", help="Also save machine-readable JSON to --output-dir")
     ap.add_argument("--output-dir", default="/tmp")
+    ap.add_argument("--html", action="store_true", help="Also save a styled HTML report (fonts, colours, tables) to --output-dir")
+    ap.add_argument("--color", action="store_true", help="Force colours even when the output is not a terminal (e.g. | less -R)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="No progress messages on stderr")
     ap.add_argument("--version", action="version", version=VERSION)
@@ -3126,7 +3395,7 @@ def main(argv=None):
                  "Use 'sudo -i' first for a complete RCA.")
     ctx.progress("Window: %s -> %s %s" % (start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M"), TZ_NAME))
     R = investigate(ctx, start, end, how)
-    color = sys.stdout.isatty() and not args.no_color
+    color = not args.no_color and (args.color or (sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
     text = build_report(ctx, R, color).render()
     md = build_markdown(ctx, R) if args.markdown else ""
     sys.stdout.write(text)
@@ -3141,6 +3410,12 @@ def main(argv=None):
                 if md:
                     f.write("\n" + md + "\n")
             print("Report saved: %s.txt" % stem, file=sys.stderr)
+        if args.html:
+            sub = "%s - %s to %s %s - generated %s" % (R["base"]["hostname"], start.strftime("%Y-%m-%d %H:%M"),
+                                                     end.strftime("%Y-%m-%d %H:%M"), TZ_NAME, now.strftime("%Y-%m-%d %H:%M"))
+            with open(stem + ".html", "w", encoding="utf-8") as f:
+                f.write(build_report(ctx, R, d=HtmlReport(sub)).render())
+            print("HTML report saved: %s.html" % stem, file=sys.stderr)
         if args.json:
             with open(stem + ".json", "w", encoding="utf-8") as f:
                 json.dump(json_safe(R), f, indent=1)

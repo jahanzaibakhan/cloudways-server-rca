@@ -4,6 +4,7 @@ Run with:  python3 -m unittest discover -s tests -v
 """
 import io
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -292,6 +293,29 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Traffic status", phase2)
         self.assertNotIn("shopapp", phase2.replace("shop.example.com", ""))
 
+    def test_customer_report_lists_slow_php(self):
+        phase2 = self.out.split(">>> BEGIN CUSTOMER RESPONSE >>>")[1].split("<<< END CUSTOMER RESPONSE <<<")[0]
+        self.assertIn("Slow PHP requests and database queries", phase2)
+        self.assertIn("plugin:heavy-plugin", phase2)
+        self.assertIn("wp-content/plugins/heavy-plugin/sync.php:42", phase2)
+        self.assertIn("During incidents", phase2)
+
+    def test_html_and_colour_output(self):
+        out = tempfile.mkdtemp()
+        try:
+            frm = (T0 - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+            code, text, err = run_main(["--from", frm, "--apps-root", self.fx.apps, "--skip-mysql", "--color", "--html",
+                                        "--output-dir", out, "--quiet"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("\033[", text)
+            page = open(os.path.join(out, [f for f in os.listdir(out) if f.endswith(".html")][0])).read()
+            self.assertIn('<div class="phase p2">', page)
+            self.assertIn('<div class="customer">', page)
+            self.assertNotIn("\033[", page)
+            self.assertEqual(page.count("<table"), page.count("</table>"))
+        finally:
+            shutil.rmtree(out)
+
     def test_oom(self):
         self.assertIn(": 3 (3 server-wide, 0 cgroup-limited)", self.out)
         self.assertIn("Memory exhaustion", self.out)
@@ -320,6 +344,33 @@ class EndToEnd(unittest.TestCase):
         md = self.out.split("TICKET FORMAT (MARKDOWN)")[1]
         self.assertIn("### Top 5 culprits", md)
         self.assertIn("**Verdict:**", md)
+
+
+class TrafficScale(unittest.TestCase):
+    """The same traffic must not be 'abnormal' on a large server just because it would be on a small one."""
+
+    def assess(self, ram_gb):
+        hours = rca.Counter({(T0 - timedelta(hours=h)).strftime("%Y-%m-%d %H"): 1000 for h in range(1, 24)})
+        hours[T0.strftime("%Y-%m-%d %H")] = 9000                              # 9x the median hour
+        app = {"req": 32000, "s5": 10, "bots": 16000, "login": 1500, "xmlrpc": 0, "top_ips": [("203.0.113.9", 12000)],
+               "hours": hours, "peak_hour": T0.strftime("%Y-%m-%d %H"), "peak_hour_req": 9000, "unique_ips": 900}
+        R = {"traffic": {"per_app": {"shop": app}, "hour_req": hours, "hour_5xx": rca.Counter()},
+             "base": {"ips": ["198.51.100.1"], "ram_gb": ram_gb},
+             "meta": {"start": T0 - timedelta(hours=23), "end": T0 + timedelta(hours=1)}}
+        return rca.traffic_assessment(rca.Ctx(), R), rca.app_traffic_status(rca.Ctx(), R, "shop")
+
+    def test_32k_a_day_is_normal_on_32gb(self):
+        ta, st = self.assess(32)
+        self.assertEqual(ta["signals"], [])
+        self.assertEqual(ta["level"], "low")
+        self.assertIn("low for a 32 GB server", ta["ddos"])
+        self.assertEqual(st["status"], "Normal")
+
+    def test_same_traffic_is_flagged_on_2gb(self):
+        ta, st = self.assess(2)
+        self.assertTrue(ta["spike"])
+        self.assertGreaterEqual(len(ta["signals"]), 3)
+        self.assertEqual(st["status"], "Needs review")
 
 
 class Prompt(unittest.TestCase):

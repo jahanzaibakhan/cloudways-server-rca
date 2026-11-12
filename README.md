@@ -19,7 +19,7 @@ curl -sS https://raw.githubusercontent.com/jahanzaibakhan/cloudways-server-rca/m
 The script asks for the window (it reads your answers from the terminal, so it works through `curl | python3 -`):
 
 ```text
-Cloudways Server RCA Investigator v1.1.0
+Cloudways Server RCA Investigator v1.2.0
 Server time now: 2026-11-12 10:22 UTC
 Enter the investigation window in server time. Accepted examples:
   2026-11-05 | 2026-11-05 14:30 | 05-11-2026 | Nov 5 | yesterday | 7d | 24h | now
@@ -93,9 +93,33 @@ Everything between `>>> BEGIN CUSTOMER RESPONSE >>>` and `<<< END CUSTOMER RESPO
 - **Summary** - what happened, in plain language
 - **What we found** - memory events, restarts, CPU and memory usage, PHP worker limits, slow queries, traffic
 - **Top applications by CPU and memory usage** - the same top 3, with traffic status and insight
+- **Slow PHP requests and database queries (supporting evidence)** - per website: requests over 5 s / 30 s, slow-log entries with the plugin, theme and function responsible, the slowest pages; per database: slow queries, total and longest time, and the slowest queries with values masked. Each row shows how much of it fell **during the incident hours** (hours with out-of-memory events, restarts, service failures or bursts of 5xx errors), so the customer can see which slow activity lines up with the outages
 - **Recommendations** - including the upscale recommendation when one applies
 
 `--markdown` appends the RCA in ticket format (customer paragraph, top 5 culprits, top applications, other findings, optimizations, upscale, verdict).
+
+## Traffic is judged against the server size
+
+A busy hour, one prominent client or a high bot share is only flagged when the volume is large enough to load the server. The threshold is about **1,500 requests/hour per GB of RAM** (minimum 3,000):
+
+| Server | Flagged from |
+|--------|--------------|
+| 2 GB | 3,000 requests/hour |
+| 8 GB | 12,000 requests/hour |
+| 32 GB | 48,000 requests/hour |
+
+So 32,000 requests a day on a 32 GB server is reported as low volume and "Normal", while the same traffic on a 2 GB server is flagged for review. An application is only checked for a dominant IP or bot share when it receives at least 1/20 of that threshold per hour. The 5xx error rate is always reported, whatever the volume.
+
+## Colours and HTML
+
+- In a terminal the report is coloured: phase banners, section headings, severity tags (`CRITICAL` red, `WARNING` yellow, `OK` green) and the traffic status column. Colours are off automatically when the output is piped or saved; `--color` forces them (for example with `| less -R`) and `--no-color` disables them.
+- `--html` also saves a self-contained HTML page (proper fonts, coloured phase banners, badges, striped tables, the customer response in its own box) to `--output-dir`. It loads nothing from the internet, so it can be opened offline, printed to PDF or attached to a ticket.
+
+```bash
+curl -sS https://raw.githubusercontent.com/jahanzaibakhan/cloudways-server-rca/main/server_rca.py | python3 - --last 7d --html
+# then, from your own machine:
+scp root@SERVER_IP:/tmp/server_rca_*.html .
+```
 
 ## Options
 
@@ -104,6 +128,8 @@ Everything between `>>> BEGIN CUSTOMER RESPONSE >>>` and `<<< END CUSTOMER RESPO
 | `--from`, `--to` | Window in server time; skips the prompt |
 | `--last 7d` | Window ending now |
 | `--top N` | Rows in per-application tables (default 10) |
+| `--html` | Also save a styled HTML report to `--output-dir` |
+| `--color` / `--no-color` | Force or disable terminal colours |
 | `--markdown` | Also print the ticket-format RCA |
 | `--save`, `--json`, `--output-dir` | Save the report / machine-readable results (default `/tmp`) |
 | `--skip-traffic`, `--skip-php`, `--skip-mysql`, `--skip-history` | Skip a slow or unavailable part |
@@ -137,6 +163,7 @@ Upscale guidance follows the usual support rules: 4 GB or 8 GB with 30+ apps mea
 ## Safety
 
 - Read-only: no restarts, kills, config changes or package installs.
+- Nothing is written to the server unless you ask for a file with `--save`, `--html` or `--json` (written to `--output-dir`, default `/tmp`).
 - Every subprocess runs with a timeout and without a shell.
 - SQL literals are masked; URL query strings are dropped; credentials are never printed. If Redis requires a password, it is read from the Redis config and passed through the environment only.
 - Imunify and other internal tooling appear only in internal sections, never in the customer paragraph.
@@ -146,7 +173,7 @@ Upscale guidance follows the usual support rules: 4 GB or 8 GB with 30+ apps mea
 - History depends on log retention: syslog usually keeps about 7 days, kern.log about 4 weeks, atop about 28 days. The report notes when the window is older than the logs.
 - atop records only processes active in an interval, so per-consumer RSS is a lower bound.
 - The PHP-FPM worst-case memory figure is an estimate (workers allowed x measured average worker size).
-- Validation status of v1.1.0: the parsers are covered by fixture tests, and a full run was verified on a live Cloudways server as a non-root user (atop, traffic, PHP-FPM access logs, configuration). The root-only paths (kernel OOM reports, MySQL, PHP-FPM master log) are verified against fixtures only so far.
+- Validation status of v1.2.0: the parsers are covered by fixture tests, and a full run was verified on a live Cloudways server as a non-root user (atop, traffic, PHP-FPM access logs, configuration). The root-only paths (kernel OOM reports, MySQL, PHP-FPM master log) are verified against fixtures only so far.
 
 ## Tests
 
