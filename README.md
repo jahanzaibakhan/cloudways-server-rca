@@ -19,7 +19,7 @@ curl -sS https://raw.githubusercontent.com/jahanzaibakhan/cloudways-server-rca/m
 The script asks for the window (it reads your answers from the terminal, so it works through `curl | python3 -`):
 
 ```text
-Cloudways Server RCA Investigator v1.0.0
+Cloudways Server RCA Investigator v1.1.0
 Server time now: 2026-11-12 10:22 UTC
 Enter the investigation window in server time. Accepted examples:
   2026-11-05 | 2026-11-05 14:30 | 05-11-2026 | Nov 5 | yesterday | 7d | 24h | now
@@ -63,25 +63,39 @@ All times are **server local time** (UTC on Cloudways).
 
 ## What the report contains
 
+The report has two phases, with the most useful information first.
+
+### Phase 1 - Full insights (internal, sharing optional)
+
 | # | Section | What you get |
 |---|---------|--------------|
-| 1 | Investigation overview | Server, window, privileges, log sources used, data-availability notes |
-| 2 | Server baseline and current state | RAM / vCPU / disk, app count and types, uptime, memory by consumer, largest processes, service status |
-| 3 | Incident timeline | One row per day: OOM kills, reboots, service failures, FPM `max_children` hits, slow queries, requests, 5xx, CPU and memory. Hourly breakdown of the worst day |
-| 4 | OOM analysis | Kills by process, day and hour; swap state at kill time; **who actually held the memory** (parsed from the kernel task dump, PHP workers attributed to their application) |
-| 5 | Reboots and service stability | Boot times with or without a clean shutdown record; service starts and systemd failure events |
-| 6 | Resource history (atop) | Per-day CPU / memory / swap / load / iowait / steal; top CPU and memory consumers per application; worst intervals with who was responsible |
-| 7 | Configuration review | Apache MPM limits (flags `MaxRequestWorkers=36000`), PHP-FPM over-commit, `memory_limit`, InnoDB buffer pool, Redis `maxmemory`, Elasticsearch heap, Varnish; a memory budget vs RAM |
-| 8 | PHP-FPM | Per app: PHP requests, CPU-seconds, ms/request, slow requests, memory per request, `max_children` hits, slow-log traces with the plugin responsible, top paths by CPU |
-| 9 | MySQL / MariaDB | Uptime and restarts, crash recoveries, connection errors, slow queries per database, top query fingerprints (literals masked) |
-| 10 | Traffic | Per app: requests, unique IPs, 5xx, bot share, wp-login / xmlrpc hits, peak hour, top IP; worst 5xx hours matched to OOM kills; DDoS assessment |
-| 11 | Evidence | Each OOM kill with victim, RSS, trigger and memory holders; raw kernel lines |
-| 12 | Key findings | Severity-ranked findings, each with evidence and a next action |
-| 13 | Root cause analysis | Root cause and confidence, top 5 culprits, other findings, optimizations, **upscale yes/no/optional**, verdict |
-| 14 | Internal note - Imunify | Only when Imunify contributed. Never included in the customer text |
-| 15 | Customer-shareable summary | A plain-language paragraph ready to paste into a ticket |
+| 1 | Executive summary | Verdict, root cause and confidence, memory driver, upscale decision, incident counts, main findings, what to do |
+| 2 | Top 3 applications | The three apps using the most CPU and memory, each with its **traffic status** (Normal / Elevated errors / Needs review) and a one-line insight: is the load caused by traffic or by the application itself? |
+| 3 | Investigation overview | Server, window, privileges, log sources used, data-availability notes |
+| 4 | Server baseline and current state | RAM / vCPU / disk, app count and types, uptime, memory by consumer, largest processes, service status |
+| 5 | Incident timeline | One row per day: OOM kills, reboots, service failures, FPM `max_children` hits, slow queries, requests, 5xx, CPU and memory. Hourly breakdown of the worst day |
+| 6 | OOM analysis | Kills by process, day and hour; swap state at kill time; **who actually held the memory** (from the kernel task dump, PHP workers attributed to their application) |
+| 7 | Reboots and service stability | Boot times with or without a clean shutdown record; service starts and systemd failure events |
+| 8 | Resource history (atop) | Per-day CPU / memory / swap / load / iowait / steal; top consumers; worst intervals with who was responsible |
+| 9 | Configuration review | Apache MPM limits (flags `MaxRequestWorkers=36000`), PHP-FPM over-commit, `memory_limit`, InnoDB buffer pool, Redis `maxmemory`, Elasticsearch heap, Varnish; a memory budget vs RAM |
+| 10 | PHP-FPM | Per app: PHP requests, CPU-seconds, ms/request, slow requests, memory per request, `max_children` hits, slow-log traces with the plugin responsible, top paths by CPU |
+| 11 | MySQL / MariaDB | Uptime and restarts, crash recoveries, connection errors, slow queries per database, top query fingerprints (literals masked) |
+| 12 | Traffic | Per app: requests, unique IPs, 5xx, bot share, wp-login / xmlrpc hits, peak hour, top IP; worst 5xx hours matched to OOM kills; DDoS assessment |
+| 13 | Evidence | Each OOM kill with victim, RSS, trigger and memory holders; raw kernel lines |
+| 14 | Key findings | Severity-ranked findings, each with evidence and a next action |
+| 15 | Root cause analysis | Top 5 culprits, other findings, optimizations, upscale, verdict |
+| - | Internal note - Imunify | Only when Imunify contributed. Never share |
 
-`--markdown` appends the same RCA in ticket format (customer paragraph, top 5 culprits table, other findings, optimizations, upscale, verdict).
+### Phase 2 - Customer-shareable report
+
+Everything between `>>> BEGIN CUSTOMER RESPONSE >>>` and `<<< END CUSTOMER RESPONSE <<<` is safe to send as-is. It uses domain names instead of application folder names and leaves out internal tooling and platform-side configuration.
+
+- **Summary** - what happened, in plain language
+- **What we found** - memory events, restarts, CPU and memory usage, PHP worker limits, slow queries, traffic
+- **Top applications by CPU and memory usage** - the same top 3, with traffic status and insight
+- **Recommendations** - including the upscale recommendation when one applies
+
+`--markdown` appends the RCA in ticket format (customer paragraph, top 5 culprits, top applications, other findings, optimizations, upscale, verdict).
 
 ## Options
 
@@ -132,7 +146,7 @@ Upscale guidance follows the usual support rules: 4 GB or 8 GB with 30+ apps mea
 - History depends on log retention: syslog usually keeps about 7 days, kern.log about 4 weeks, atop about 28 days. The report notes when the window is older than the logs.
 - atop records only processes active in an interval, so per-consumer RSS is a lower bound.
 - The PHP-FPM worst-case memory figure is an estimate (workers allowed x measured average worker size).
-- Validation status of v1.0.0: the parsers are covered by fixture tests, and a full run was verified on a live Cloudways server as a non-root user (atop, traffic, PHP-FPM access logs, configuration). The root-only paths (kernel OOM reports, MySQL, PHP-FPM master log) are verified against fixtures only so far.
+- Validation status of v1.1.0: the parsers are covered by fixture tests, and a full run was verified on a live Cloudways server as a non-root user (atop, traffic, PHP-FPM access logs, configuration). The root-only paths (kernel OOM reports, MySQL, PHP-FPM master log) are verified against fixtures only so far.
 
 ## Tests
 

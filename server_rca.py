@@ -38,7 +38,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 WIDTH = 100
 
 # ----------------------------------------------------------------------------
@@ -2013,7 +2013,7 @@ def analyze(ctx, R):
                    "(currently %d workers allowed), and keep memory_limit at 256M unless an app proves it needs more."
                    % cfg["fpm"]["total_children"])
     if "Apache MaxRequestWorkers" in cfg_text:
-        opt.append("Fix Apache MPM limits (MaxRequestWorkers / ServerLimit) to a value the RAM can serve.")
+        opt.append("[INTERNAL] Fix Apache MPM limits (MaxRequestWorkers / ServerLimit) to a value the RAM can serve.")
     if "innodb_buffer_pool_size" in cfg_text or drv_key == "mysql":
         opt.append("Resize innodb_buffer_pool_size to roughly 25-40% of RAM on this shared web+DB server.")
     if "Redis maxmemory" in cfg_text:
@@ -2062,8 +2062,10 @@ def analyze(ctx, R):
     else:
         up = ("No", "", "No capacity-driven incident in this window.")
     A["upscale"] = up
+    A["top_apps"] = top_apps(ctx, R, 3)
     A["verdict"] = build_verdict(ctx, R, A, o)
     A["customer"] = customer_paragraph(ctx, R, A, o)
+    A["customer_short"] = customer_paragraph(ctx, R, A, o, with_recs=False)
     R["analysis"] = A
     return A
 
@@ -2141,7 +2143,7 @@ def build_verdict(ctx, R, A, o):
                                         " to " + A["upscale"][1] if A["upscale"][1] else "")
 
 
-def customer_paragraph(ctx, R, A, o):
+def customer_paragraph(ctx, R, A, o, with_recs=True):
     """Plain-language summary. Never mentions internal security tooling."""
     b, at, ta = R["base"], R.get("atop"), A["traffic"]
     w = R["meta"]
@@ -2193,9 +2195,13 @@ def customer_paragraph(ctx, R, A, o):
     if ta["req"]:
         if ta["signals"] and ("Possible abusive" in ta["ddos"]):
             s.append("We also noticed unusual traffic from a small number of sources, which we recommend limiting.")
+        elif ta["signals"]:
+            s.append("We found no evidence of a DDoS attack or of the server being compromised.")
         else:
             s.append("We found no evidence of a DDoS attack or of the server being compromised; traffic levels were "
                      "consistent with normal activity.")
+    if not with_recs:
+        return " ".join(s)
     recs = [x for x in A["optimizations"] if not x.startswith("[INTERNAL]") and not x.startswith("No change")]
     up = A["upscale"]
     if recs:
@@ -2211,6 +2217,134 @@ def customer_paragraph(ctx, R, A, o):
 # ----------------------------------------------------------------------------
 # Report rendering
 # ----------------------------------------------------------------------------
+def app_traffic_status(ctx, R, name):
+    """Traffic verdict for one application: Normal / Elevated errors / Needs review, with the reasons."""
+    a = R["traffic"]["per_app"].get(name)
+    if not a:
+        return {"status": "No data", "flags": [], "detail": "no web access log data for the window", "req": 0}
+    own = set(R["base"]["ips"]) | {"127.0.0.1", "::1"}
+    hours = sorted(a["hours"].values())
+    median = hours[len(hours) // 2]
+    window_h = max((R["meta"]["end"] - R["meta"]["start"]).total_seconds() / 3600.0, 0.02)
+    flags, errors = [], False
+    if a["s5"] >= 20 and pct(a["s5"], a["req"]) >= 5:
+        errors = True
+        flags.append("%.0f%% of responses are 5xx errors" % pct(a["s5"], a["req"]))
+    if a["req"] >= 500 and pct(a["bots"], a["req"]) >= 40:
+        flags.append("%.0f%% of requests come from bots/tools" % pct(a["bots"], a["req"]))
+    ext = [(ip, n) for ip, n in a["top_ips"] if ip not in own]
+    if a["req"] >= 2000 and ext and pct(ext[0][1], a["req"]) >= 25:
+        flags.append("one IP (%s) sends %.0f%% of requests" % (ext[0][0], pct(ext[0][1], a["req"])))
+    if a["login"] >= 1000:
+        flags.append("%s wp-login.php requests" % fmt_num(a["login"]))
+    if a["xmlrpc"] >= 1000:
+        flags.append("%s xmlrpc.php requests" % fmt_num(a["xmlrpc"]))
+    if len(hours) >= 6 and a["peak_hour_req"] >= max(median * 6, 1000):
+        flags.append("spike of %s requests at %s:00 (median %s/hour)" % (fmt_num(a["peak_hour_req"]), a["peak_hour"], fmt_num(median)))
+    status = "Normal" if not flags else ("Elevated errors" if errors and len(flags) == 1 else "Needs review")
+    return {"status": status, "flags": flags, "req": a["req"], "per_hour": a["req"] / window_h,
+            "peak_hour": a["peak_hour"], "peak_hour_req": a["peak_hour_req"], "unique_ips": a["unique_ips"],
+            "s5_pct": pct(a["s5"], a["req"]), "bot_pct": pct(a["bots"], a["req"]),
+            "detail": "%s requests (%s/hour avg, peak %s at %s:00), %s IPs, 5xx %.1f%%, bots %.0f%%"
+                      % (fmt_num(a["req"]), fmt_num(int(round(a["req"] / window_h))), fmt_num(a["peak_hour_req"]),
+                         a["peak_hour"][5:], fmt_num(a["unique_ips"]), pct(a["s5"], a["req"]), pct(a["bots"], a["req"]))}
+
+
+def top_apps(ctx, R, n=3):
+    """Applications ranked by combined CPU and memory share of the server, each with its traffic status."""
+    at, base, pa = R.get("atop"), R["base"], R["phpacc"]["per_app"]
+    window_s = max((R["meta"]["end"] - R["meta"]["start"]).total_seconds(), 1.0)
+    hist = {x["owner"]: x for x in at["owners"] if x["kind"] == "app"} if at else {}
+    live = {k[1]: g for k, g in R["live"]["groups"] if k[0] == "app"}
+    ram_kb, ncpu = base["ram_kb"] or 1, base["ncpu"] or 1
+    rows = []
+    for name in set(hist) | set(pa) | set(live) | set(R["traffic"]["per_app"]):
+        h, v = hist.get(name), pa.get(name)
+        r = {"app": name, "domain": ctx.apps.get(name, {}).get("domain") or "", "type": ctx.apps.get(name, {}).get("type", "?"),
+             "cpu_peak": None, "cpu_peak_at": "", "mem_avg_kb": None, "mem_peak_kb": None}
+        if h:
+            r.update(cpu_avg=h["cpu_avg"], cpu_peak=h["cpu_peak"], cpu_peak_at=h["cpu_peak_at"], cpu_src="atop history",
+                     mem_avg_kb=h["rss_avg_kb"], mem_peak_kb=h["rss_peak_kb"], mem_src="atop history")
+        else:
+            r.update(cpu_avg=(v["cpu_s"] / window_s * 100.0) if v else 0.0,
+                     cpu_src="PHP-FPM access log (estimated)" if v else "n/a")
+            if name in live:
+                r.update(mem_avg_kb=live[name]["rss_kb"], mem_src="live (now)")
+            else:
+                r["mem_src"] = "n/a"
+        r["srv_pct"] = r["cpu_avg"] / ncpu
+        r["mem_pct"] = pct(r["mem_avg_kb"] or 0, ram_kb) if base["ram_kb"] else 0.0
+        r["php_req"] = v["req"] if v else None
+        r["ms_req"] = (v["cpu_s"] / v["req"] * 1000.0) if v and v["req"] else None
+        r["mb_req"] = (v["mem_sum"] / v["req"]) if v and v["req"] else None
+        r["slow5"] = v["slow5"] if v else None
+        r["traffic"] = app_traffic_status(ctx, R, name)
+        r["score"] = r["srv_pct"] + r["mem_pct"]
+        rows.append(r)
+    rows.sort(key=lambda r: (-r["score"], -(r["traffic"]["req"])))
+    rows = rows[:n]
+    for r in rows:
+        t = r["traffic"]
+        heavy = r["srv_pct"] >= 15 or r["mem_pct"] >= 15
+        if t["status"] == "No data":
+            ins = "Traffic could not be measured, so resource use cannot be matched to load."
+        elif t["status"] == "Normal" and heavy:
+            ins = ("High resource use while traffic is normal - this points to inefficient application execution "
+                   "(code, plugins, scheduled tasks), not to visitor load.")
+        elif t["status"] == "Elevated errors" and heavy:
+            ins = ("High resource use with normal visitor volume, and %s - the errors are a symptom of the "
+                   "overload, not a traffic problem." % t["flags"][0])
+        elif t["status"] == "Elevated errors":
+            ins = "Resource use is modest and visitor volume is normal, but %s - check the application error log." % t["flags"][0]
+        elif t["status"] != "Normal" and heavy:
+            ins = "High resource use coincides with a traffic issue (%s) - address the traffic first." % "; ".join(t["flags"][:2])
+        elif t["status"] != "Normal":
+            ins = "Resource use is low, but traffic needs attention (%s)." % "; ".join(t["flags"][:2])
+        else:
+            ins = "Resource use is modest and traffic is normal - not a driver of the incident."
+        if (r["ms_req"] or 0) >= 400:
+            ins += " PHP is expensive per request (%.0f ms CPU on average)." % r["ms_req"]
+        r["insight"] = ins
+    return rows
+
+
+def customer_findings(ctx, R, A):
+    """Customer-safe bullet points. No internal tooling, no platform-side configuration."""
+    o, at, ta = R["oom"], R.get("atop"), A["traffic"]
+    out = []
+
+    def dom(name):
+        return ctx.apps.get(name, {}).get("domain") or name
+    if o["global"]:
+        out.append("The server ran out of memory %d time(s)%s. Each time, the operating system stopped a running "
+                   "service to recover, which interrupts the websites briefly."
+                   % (o["global"], " (worst day: %s with %d events)" % o["peak_day"] if o["peak_day"] else ""))
+    elif R["sys"]["checked"]:
+        out.append("No out-of-memory events were recorded.")
+    if R["reboots"]:
+        out.append("The server restarted %d time(s): %s." % (len(R["reboots"]), ", ".join(r["ts"].strftime("%b %d %H:%M") for r in R["reboots"][:5])))
+    elif R["sys"]["checked"]:
+        out.append("The server did not restart during the period.")
+    if at:
+        out.append("Processor usage averaged %.0f%% and peaked at %.0f%%; memory usage averaged %.0f%% and peaked at %.0f%%."
+                   % (at["cpu_avg"], at["cpu_peak"], at["mem_avg"], at["mem_peak"]))
+    mc = sorted(((a, v["max_children"]) for a, v in R["fpm"]["per_app"].items() if v["max_children"]), key=lambda x: -x[1])
+    if mc:
+        out.append("The PHP worker limit was reached %d time(s) on %s, meaning requests had to wait for a free worker."
+                   % (sum(c for _, c in mc), ", ".join(dom(a) for a, _ in mc[:3])))
+    sl = R["mysql_slow"]
+    if sl["total"] >= 20:
+        dbs = [dom(db) for db in list(sl["by_db"])[:2] if db != "(unknown)"]
+        out.append("%s slow database queries were recorded%s." % (fmt_num(sl["total"]), ", mostly for " + ", ".join(dbs) if dbs else ""))
+    restarts = len(R["mysql_err"]["startups"])
+    if restarts:
+        out.append("The database service restarted %d time(s) during the period." % restarts)
+    if ta["req"]:
+        out.append("Traffic: %s requests were served, %.1f%% of them with server errors (5xx). %s"
+                   % (fmt_num(ta["req"]), ta["rate5"], ta["ddos"].replace(" (see signals)", "")))
+    return out
+
+
 class Report:
     def __init__(self, color=False):
         self.out, self.color, self.n = [], color, 0
@@ -2224,6 +2358,9 @@ class Report:
     def h2(self, t):
         self.n += 1
         self.out += ["", "-" * WIDTH, self.c("%d. %s" % (self.n, t), "bold"), "-" * WIDTH]
+
+    def phase(self, t, sub):
+        self.out += ["", "#" * WIDTH, self.c(("  " + t).ljust(WIDTH), "bold"), "  " + sub, "#" * WIDTH]
 
     def h3(self, t):
         self.out += ["", self.c("▸ " + t, "bold")]
@@ -2273,6 +2410,47 @@ class Report:
         return "\n".join(self.out) + "\n"
 
 
+def render_top_apps(d, ctx, rows, customer=False):
+    """Top applications by CPU and memory with traffic status. customer=True uses domains only."""
+    if not rows:
+        d.bullet("No application activity could be measured in the window.", "info")
+        return
+
+    def label(r):
+        return (r["domain"] or r["app"]) if customer else r["app"]
+    res = []
+    for i, r in enumerate(rows, 1):
+        row = [i, label(r)]
+        if not customer:
+            row += [trunc(r["domain"], 30), r["type"]]
+        row += ["%.0f%%" % r["cpu_avg"], "%.0f%%" % r["cpu_peak"] if r["cpu_peak"] is not None else "-", "%.0f%%" % r["srv_pct"],
+                fmt_kb(r["mem_avg_kb"]) if r["mem_avg_kb"] is not None else "-",
+                fmt_kb(r["mem_peak_kb"]) if r["mem_peak_kb"] is not None else "-", "%.0f%%" % r["mem_pct"]]
+        if not customer:
+            row += [fmt_num(r["php_req"]) if r["php_req"] is not None else "-", "%.0f" % r["ms_req"] if r["ms_req"] is not None else "-"]
+        res.append(row)
+    heads = ["#", "Website" if customer else "Application"] + ([] if customer else ["Domain", "Type"]) + \
+            ["CPU avg", "CPU peak", "Server CPU", "Mem avg", "Mem peak", "RAM share"] + ([] if customer else ["PHP req", "CPU ms/req"])
+    d.table(heads, res, align=["r", "l"] + ([] if customer else ["l", "l"]) + ["r"] * (len(heads) - (2 if customer else 4)))
+    d.text("CPU avg/peak are % of one CPU core; Server CPU is the share of the whole server."
+           + ("" if customer else " Source: %s." % ", ".join(sorted({r["cpu_src"] for r in rows}))))
+    tr = []
+    for i, r in enumerate(rows, 1):
+        t = r["traffic"]
+        if t["status"] == "No data":
+            tr.append([i, label(r), "-", "-", "-", "-", "-", "No data"])
+        else:
+            tr.append([i, label(r), fmt_num(t["req"]), fmt_num(int(round(t["per_hour"]))),
+                       "%s (%s:00)" % (fmt_num(t["peak_hour_req"]), t["peak_hour"][5:]), "%.1f%%" % t["s5_pct"],
+                       "%.0f%%" % t["bot_pct"], t["status"]])
+    d.table(["#", "Website" if customer else "Application", "Requests", "Per hour", "Peak hour", "5xx", "Bots", "Traffic status"],
+            tr, align=["r", "l", "r", "r", "r", "r", "r", "l"])
+    for i, r in enumerate(rows, 1):
+        d.bullet("%d. %s: %s" % (i, label(r), r["insight"]))
+        for f in r["traffic"]["flags"]:
+            d.bullet("Traffic: " + f, level=1)
+
+
 def build_report(ctx, R, color=False):
     d = Report(color)
     meta, base, A, o = R["meta"], R["base"], R["analysis"], R["oom"]
@@ -2282,6 +2460,46 @@ def build_report(ctx, R, color=False):
     d.title("CLOUDWAYS SERVER RCA INVESTIGATION REPORT")
 
     # 1 ----------------------------------------------------------------------
+    d.phase("PHASE 1 - FULL INSIGHTS (INTERNAL)",
+            "Everything found, most useful first. Sharing is optional - never share the Imunify note.")
+
+    d.h2("EXECUTIVE SUMMARY")
+    fpm_hits = sum(v["max_children"] for v in R["fpm"]["per_app"].values())
+    d.kv([
+        ("Verdict", A["verdict"]),
+        ("Root cause", "%s [%s]" % (A["root_cause"], A["confidence"])),
+        ("Memory driver", A["driver"][1] if A["driver"] else None),
+        ("Contributing", "; ".join(A["contributing"]) or None),
+        ("Upscale", "%s%s - %s" % (A["upscale"][0].upper(), " to " + A["upscale"][1] if A["upscale"][1] else "", A["upscale"][2])),
+        ("Server", "%s (%s) - %s GB RAM / %d vCPU / %d app(s)" % (base["hostname"], base["ips"][0] if base["ips"] else "?",
+                                                                  base["ram_gb"], base["ncpu"], base["apps"])),
+        ("Window", "%s -> %s %s" % (start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M"), TZ_NAME)),
+        ("Incidents", "%s OOM kill(s) | %d reboot(s) | %d service failure event(s) | %d FPM max_children hit(s) | %s slow queries"
+         % (o["total"] if R["sys"]["checked"] else "?", len(R["reboots"]), len(R["sys"]["svc_events"]), fpm_hits,
+            fmt_num(R["mysql_slow"]["total"]))),
+        ("Resources", "CPU %.0f%% avg / %.0f%% peak | memory %.0f%% avg / %.0f%% peak | swap peak %s"
+         % (at["cpu_avg"], at["cpu_peak"], at["mem_avg"], at["mem_peak"], fmt_kb(at["swap_peak_kb"])) if at else "no atop history"),
+        ("Traffic", ("%s requests, %.2f%% 5xx. %s" % (fmt_num(A["traffic"]["req"]), A["traffic"]["rate5"], A["traffic"]["ddos"]))
+         if A["traffic"]["req"] else A["traffic"]["ddos"]),
+    ])
+    if not ctx.is_root:
+        d.bullet("Not run as root - kernel logs, MySQL and PHP-FPM master logs were unreadable. Treat this as partial.", "warning")
+    main = [f for f in A["findings"] if f["sev"] in ("critical", "warning")]
+    d.h3("Main findings")
+    if main:
+        for f in main[:8]:
+            d.bullet(f["title"], f["sev"])
+        if len(main) > 8:
+            d.text("... %d more under KEY FINDINGS." % (len(main) - 8))
+    else:
+        d.bullet("Nothing abnormal detected in the window.", "ok")
+    d.h3("What to do")
+    for i, x in enumerate(A["optimizations"], 1):
+        d.text("%d. %s" % (i, x))
+
+    d.h2("TOP 3 APPLICATIONS BY CPU AND MEMORY (WITH TRAFFIC STATUS)")
+    render_top_apps(d, ctx, A["top_apps"])
+
     d.h2("INVESTIGATION OVERVIEW")
     hours = (end - start).total_seconds() / 3600.0
     d.kv([
@@ -2689,9 +2907,31 @@ def build_report(ctx, R, color=False):
                  "review resident agents (WAF daemon, DoS detector) against the server size.")
 
     # 15 ---------------------------------------------------------------------
-    d.h2("CUSTOMER-SHAREABLE SUMMARY")
+    d.phase("PHASE 2 - CUSTOMER-SHAREABLE REPORT",
+            "Safe to send as-is: no internal tooling, no platform-side configuration.")
+    d.h2("CUSTOMER-SHAREABLE REPORT")
     d.text(">>> BEGIN CUSTOMER RESPONSE >>>")
-    d.text(A["customer"])
+    d.h3("Summary")
+    d.text(A["customer_short"])
+    d.h3("What we found")
+    for x in customer_findings(ctx, R, A):
+        d.bullet(x)
+    d.h3("Top applications by CPU and memory usage (with traffic status)")
+    render_top_apps(d, ctx, A["top_apps"], customer=True)
+    recs = [x for x in A["optimizations"] if not x.startswith("[INTERNAL]") and not x.startswith("No change")]
+    d.h3("Recommendations")
+    for k, x in enumerate(recs, 1):
+        d.text("%d. %s" % (k, x))
+    up2 = A["upscale"]
+    if up2[0] == "Yes":
+        d.text("%d. Upgrade the server to %s so it has enough capacity for the current workload." % (len(recs) + 1, up2[1]))
+    elif up2[0] == "Optional":
+        d.text("%d. If the issue recurs after the changes above, upgrade the server to %s." % (len(recs) + 1, up2[1]))
+    elif not recs and A["root_cause"].startswith("Inconclusive"):
+        d.text("Recommendations will follow once the full analysis is complete.")
+    elif not recs:
+        d.text("No action is required at this time; we will continue to monitor the server.")
+    d.blank()
     d.text("<<< END CUSTOMER RESPONSE <<<")
     d.blank()
     return d
@@ -2750,6 +2990,19 @@ def build_markdown(ctx, R):
         L += ["", "**Total OOM kills (window):** 0 | Reboots: %d" % len(R["reboots"])]
     else:
         L += ["No OOM kills and no atop history. Reboots: %d" % len(R["reboots"])]
+    if A["top_apps"]:
+        L += ["", "---", "", "### Top applications (CPU / memory / traffic)", "",
+              "| # | Application | CPU avg | CPU peak | Mem avg | Mem peak | Requests | 5xx | Traffic status |",
+              "|---|-------------|---------|----------|---------|----------|----------|-----|----------------|"]
+        for k, r in enumerate(A["top_apps"], 1):
+            t = r["traffic"]
+            L.append("| %d | %s | %.0f%% | %s | %s | %s | %s | %s | %s |" % (
+                k, "%s (%s)" % (r["app"], r["domain"]) if r["domain"] else r["app"], r["cpu_avg"],
+                "%.0f%%" % r["cpu_peak"] if r["cpu_peak"] is not None else "-",
+                fmt_kb(r["mem_avg_kb"]) if r["mem_avg_kb"] is not None else "-",
+                fmt_kb(r["mem_peak_kb"]) if r["mem_peak_kb"] is not None else "-",
+                fmt_num(t["req"]) if t["req"] else "-", "%.1f%%" % t["s5_pct"] if t["req"] else "-",
+                t["status"] + (": " + "; ".join(t["flags"][:2]) if t["flags"] else "")))
     L += ["", "---", "", "### Other findings (brief)", "", "| Area | Finding |", "|------|---------|"]
     L += ["| %s | %s |" % (a, f.replace("|", "/")) for a, f in brief_findings(ctx, R)]
     L += ["", "### Optimizations needed", ""] + ["%d. %s" % (i, x) for i, x in enumerate(A["optimizations"], 1)]

@@ -275,8 +275,22 @@ class EndToEnd(unittest.TestCase):
 
     def test_runs(self):
         self.assertEqual(self.code, 0, self.err)
-        for n in range(1, 15):
+        for n in range(1, 17):
             self.assertIn("\n%d. " % n, self.out)
+        # usable info first, customer-shareable phase last
+        order = [self.out.index(x) for x in ("PHASE 1 - FULL INSIGHTS", "EXECUTIVE SUMMARY", "TOP 3 APPLICATIONS BY CPU",
+                                             "INVESTIGATION OVERVIEW", "ROOT CAUSE ANALYSIS", "PHASE 2 - CUSTOMER-SHAREABLE")]
+        self.assertEqual(order, sorted(order))
+
+    def test_top_apps(self):
+        top = self.out.split("TOP 3 APPLICATIONS BY CPU")[1].split("INVESTIGATION OVERVIEW")[0]
+        self.assertLess(top.index("shopapp"), top.index("blogapp"))       # ranked by CPU + memory
+        self.assertIn("Elevated errors", top)                              # shopapp: 13% 5xx
+        self.assertIn("Normal", top)                                       # blogapp
+        phase2 = self.out.split("PHASE 2 - CUSTOMER-SHAREABLE")[1].split("<<< END CUSTOMER RESPONSE <<<")[0]
+        self.assertIn("shop.example.com", phase2)
+        self.assertIn("Traffic status", phase2)
+        self.assertNotIn("shopapp", phase2.replace("shop.example.com", ""))
 
     def test_oom(self):
         self.assertIn(": 3 (3 server-wide, 0 cgroup-limited)", self.out)
@@ -300,7 +314,7 @@ class EndToEnd(unittest.TestCase):
 
     def test_customer_text_hides_internal_tooling(self):
         body = self.out.split(">>> BEGIN CUSTOMER RESPONSE >>>")[1].split("<<< END CUSTOMER RESPONSE <<<")[0].lower()
-        for word in ("imunify", "rustbolit", "wafd"):
+        for word in ("imunify", "rustbolit", "wafd", "apache", "[internal]"):
             self.assertNotIn(word, body)
         self.assertIn("out-of-memory", body)
         md = self.out.split("TICKET FORMAT (MARKDOWN)")[1]
