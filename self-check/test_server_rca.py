@@ -1,6 +1,6 @@
 """Fixture-based tests: build a fake Cloudways filesystem, run the investigation, check the report.
 
-Run with:  python3 -m unittest discover -s tests -v
+Run with:  python3 -m unittest discover -s self-check -v
 """
 import io
 import os

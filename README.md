@@ -185,10 +185,10 @@ Upscale guidance follows the usual support rules: 4 GB or 8 GB with 30+ apps mea
 - The PHP-FPM worst-case memory figure is an estimate (workers allowed x measured average worker size).
 - Validation status of v1.3.0: the parsers are covered by fixture tests, and a full run was verified on a live Cloudways server as a non-root user (atop, traffic, PHP-FPM access logs, configuration). The root-only paths (kernel OOM reports, MySQL, PHP-FPM master log) are verified against fixtures only so far.
 
-## Tests
+## Self-check
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s self-check -v
 ```
 
-The tests build a fake Cloudways filesystem (applications, access logs, syslog with kernel OOM reports, a stand-in `atop`) and check the generated report.
+The `self-check` folder is not needed to run the script. It holds the automated checks run before every release: they build a fake Cloudways filesystem (applications, access logs, syslog with kernel OOM reports, a stand-in `atop`) and check the generated report.
